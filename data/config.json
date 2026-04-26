@@ -1,0 +1,19 @@
+{
+  "deviceName": "touch-controller",
+  "wifi": {
+    "ssid": "greenrun",
+    "password": "connecticut"
+  },
+  "syslog": "192.168.3.11",
+  "relayLabels": [
+    "Relay 1",
+    "Relay 2",
+    "Relay 3",
+    "Relay 4",
+    "Relay 5",
+    "Relay 6"
+  ],
+  "swarm": {
+    "enabled": true
+  }
+}

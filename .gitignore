@@ -1,0 +1,14 @@
+.pio/
+build_temp/
+compile_commands.json
+*.bin
+*.elf
+*.map
+
+# Build/serial logs that shouldn't be tracked
+build_*.txt
+boot_*.txt
+serial_log.txt
+upload_log.txt
+filtered_error.txt
+*.log

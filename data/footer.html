@@ -1,0 +1,32 @@
+</div> <!-- end main-content -->
+<footer class="main-footer">
+  <div class="footer-content">
+    <span id="footer-temp1" style="display:none;"><span id="temp1">--</span> &bull; </span>
+    <span id="footer-temp2" style="display:none;"><span id="temp2">--</span> &bull; </span>
+    <span id="uptime">--</span>
+  </div>
+</footer>
+<script>
+  document.addEventListener('DOMContentLoaded', function () {
+    if (window.BUILD_DATE) {
+      var el = document.getElementById('build-date');
+      if (el) el.textContent = window.BUILD_DATE;
+    }
+    function updateUptime() {
+      var uptimeEl = document.getElementById('uptime');
+      if (uptimeEl && typeof window.ESP_UPTIME !== 'undefined') {
+        var seconds = Math.floor(window.ESP_UPTIME / 1000);
+        var h = Math.floor(seconds / 3600);
+        var m = Math.floor((seconds % 3600) / 60);
+        var s = seconds % 60;
+        uptimeEl.textContent = h + "h " + m + "m " + s + "s";
+        window.ESP_UPTIME += 1000;
+      }
+    }
+    setInterval(updateUptime, 1000);
+    updateUptime();
+  });
+</script>
+</body>
+
+</html>

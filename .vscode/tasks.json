@@ -1,0 +1,71 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "PIO Build (touchpanel-serial)",
+      "type": "shell",
+      "command": "pio",
+      "args": [
+        "run",
+        "-e",
+        "touchpanel-serial"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "PIO Build (touchpanel-ota)",
+      "type": "shell",
+      "command": "pio",
+      "args": [
+        "run",
+        "-e",
+        "touchpanel-ota"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "PIO Upload (touchpanel-serial)",
+      "type": "shell",
+      "command": "pio",
+      "args": [
+        "run",
+        "-e",
+        "touchpanel-serial",
+        "-t",
+        "upload"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "PIO Upload (touchpanel-serial-manual)",
+      "type": "shell",
+      "command": "pio",
+      "args": [
+        "run",
+        "-e",
+        "touchpanel-serial-manual",
+        "-t",
+        "upload"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "PIO Probe Bootloader (COM6)",
+      "type": "shell",
+      "command": "C:/Users/lance/.platformio/penv/Scripts/python.exe",
+      "args": [
+        "C:/Users/lance/.platformio/packages/tool-esptoolpy/esptool.py",
+        "--port",
+        "COM6",
+        "--chip",
+        "esp32s3",
+        "chip_id"
+      ],
+      "problemMatcher": []
+    }
+  ]
+}
