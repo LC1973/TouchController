@@ -495,7 +495,7 @@ static void initRgbPanel()
     panel_config.timings.flags.pclk_active_neg = LCD_PCLK_ACTIVE_NEG;
     panel_config.data_width = 16;
     panel_config.bits_per_pixel = 16;
-    panel_config.num_fbs = 2; // Double buffer: LVGL writes one while DMA reads the other
+    panel_config.num_fbs = 1; // Single buffer: eliminates double-buffer swap timing that caused "content shift" artifact
     // Bounce buffer in internal SRAM: 20 rows × 1024 pixels.
     // Larger bounce buffer halves the ISR call rate (~1800/s vs ~3600/s at 60 Hz),
     // reducing PSRAM read contention from the bounce-buffer copy ISR.
@@ -665,6 +665,24 @@ static volatile int loraGwOverride = 0;
 static lv_obj_t *bar_bat1_soc = nullptr;
 static lv_obj_t *bar_bat2_soc = nullptr;
 static lv_obj_t *bar_signal = nullptr;
+// WiFi link monitor card widgets (power tab)
+static lv_obj_t *lbl_wifi_house_rssi        = nullptr;
+static lv_obj_t *lbl_wifi_house_snr         = nullptr;
+static lv_obj_t *lbl_wifi_house_tx          = nullptr;
+static lv_obj_t *lbl_wifi_house_rx          = nullptr;
+static lv_obj_t *bar_wifi_house_sig         = nullptr;
+static lv_obj_t *meter_wifi_house           = nullptr;
+static lv_meter_indicator_t *indic_house_tx = nullptr;
+static lv_meter_indicator_t *indic_house_rx = nullptr;
+static lv_obj_t *lbl_wifi_pad_rssi          = nullptr;
+static lv_obj_t *lbl_wifi_pad_snr           = nullptr;
+static lv_obj_t *lbl_wifi_pad_tx            = nullptr;
+static lv_obj_t *lbl_wifi_pad_rx            = nullptr;
+static lv_obj_t *bar_wifi_pad_sig           = nullptr;
+static lv_obj_t *meter_wifi_pad             = nullptr;
+static lv_meter_indicator_t *indic_pad_tx   = nullptr;
+static lv_meter_indicator_t *indic_pad_rx   = nullptr;
+static lv_obj_t *lbl_link_bolt              = nullptr;
 
 // Antenna tab UI elements
 #define MAX_ANTENNAS 8
@@ -864,7 +882,9 @@ static bool antennaDataReady = false;
 static unsigned long antennaLastUpdate = 0;
 
 static unsigned long lastPropProxyPoll = 0;
+static unsigned long lastLinkPoll = 0;
 #define PROP_PROXY_POLL_INTERVAL 30000
+#define LINK_POLL_INTERVAL       30000
 
 // Rotator memory bank: fetched from rotator /api/memory on startup and periodically
 static unsigned long lastRotatorMemoryFetch = 0;
@@ -944,6 +964,25 @@ struct SolarPropData
 };
 static SolarPropData solarData;
 static uint32_t s_propDataVersion = 0;  // incremented each time prop data is parsed
+
+// WiFi link monitor data (from PropProxy /api/link, Ubiquiti airOS SNMP)
+struct LinkEndpointData {
+    char name[32];
+    char ip[20];
+    int  rssi;        // dBm (negative)
+    int  noise;       // dBm (negative)
+    int  snr;         // dB
+    int  txRateMbps;
+    int  rxRateMbps;
+    bool connected;
+};
+struct LinkMonData {
+    LinkEndpointData house;
+    LinkEndpointData paddock;
+    bool valid;
+};
+static LinkMonData s_linkData;
+static uint32_t s_linkDataVersion = 0;
 
 static RotatorMemoryPoint rotatorMemories[3][MEM_PER_GROUP] = {
     // UK (bearings from G7NRU, Leadenham, Lincs)
@@ -1645,27 +1684,102 @@ static void pollPropagationProxy()
     }
 }
 
+static void pollLinkMonitor()
+{
+    if (millis() - lastLinkPoll < LINK_POLL_INTERVAL)
+        return;
+    lastLinkPoll = millis();
+
+    struct LinkSnap { char ip[16]; uint16_t port; };
+    LinkSnap snaps[PeerDiscovery::MAX_PEERS];
+    int snapCount = 0;
+    xSemaphoreTake(g_dataMutex, portMAX_DELAY);
+    {
+        int count = peerDiscovery.peerCount();
+        const DiscoveredPeer *peers = peerDiscovery.peers();
+        for (int i = 0; i < count && snapCount < PeerDiscovery::MAX_PEERS; i++)
+        {
+            const DiscoveredPeer &p = peers[i];
+            if (!strlen(p.ip)) continue;
+            bool isPropPeer = strstr(p.role, "prop") != nullptr
+                           || strstr(p.name, "propproxy") != nullptr
+                           || strstr(p.name, "pi5") != nullptr;
+            if (!isPropPeer) continue;
+            memcpy(snaps[snapCount].ip, p.ip, 16);
+            snaps[snapCount].port = p.port;
+            snapCount++;
+        }
+    }
+    xSemaphoreGive(g_dataMutex);
+
+    for (int s = 0; s < snapCount; s++)
+    {
+        HTTPClient http;
+        String url = "http://" + String(snaps[s].ip) + ":" + String(snaps[s].port) + "/api/link";
+        http.setTimeout(HTTP_TIMEOUT_PROP_MS);
+        if (!http.begin(url)) continue;
+        int code = http.GET();
+        if (code == 200)
+        {
+            String body = http.getString();
+            http.end();
+            JsonDocument doc;
+            if (!deserializeJson(doc, body))
+            {
+                xSemaphoreTake(g_dataMutex, portMAX_DELAY);
+                JsonObject h = doc["house"].as<JsonObject>();
+                JsonObject p = doc["paddock"].as<JsonObject>();
+                strncpy(s_linkData.house.name, h["name"] | "", sizeof(s_linkData.house.name)-1);
+                strncpy(s_linkData.house.ip,   h["ip"]   | "", sizeof(s_linkData.house.ip)-1);
+                s_linkData.house.rssi        = h["rssi"].as<int>();
+                s_linkData.house.noise       = h["noise"].as<int>();
+                s_linkData.house.snr         = h["snr"].as<int>();
+                s_linkData.house.txRateMbps  = h["txRateMbps"].as<int>();
+                s_linkData.house.rxRateMbps  = h["rxRateMbps"].as<int>();
+                s_linkData.house.connected   = h["connected"].as<bool>();
+                strncpy(s_linkData.paddock.name, p["name"] | "", sizeof(s_linkData.paddock.name)-1);
+                strncpy(s_linkData.paddock.ip,   p["ip"]   | "", sizeof(s_linkData.paddock.ip)-1);
+                s_linkData.paddock.rssi        = p["rssi"].as<int>();
+                s_linkData.paddock.noise       = p["noise"].as<int>();
+                s_linkData.paddock.snr         = p["snr"].as<int>();
+                s_linkData.paddock.txRateMbps  = p["txRateMbps"].as<int>();
+                s_linkData.paddock.rxRateMbps  = p["rxRateMbps"].as<int>();
+                s_linkData.paddock.connected   = p["connected"].as<bool>();
+                s_linkData.valid = doc["valid"].as<bool>();
+                s_linkDataVersion++;
+                xSemaphoreGive(g_dataMutex);
+                debugLogf("[LINK] House %s RSSI=%d SNR=%d TX=%dMbps | Paddock %s RSSI=%d SNR=%d TX=%dMbps",
+                    s_linkData.house.name, s_linkData.house.rssi, s_linkData.house.snr, s_linkData.house.txRateMbps,
+                    s_linkData.paddock.name, s_linkData.paddock.rssi, s_linkData.paddock.snr, s_linkData.paddock.txRateMbps);
+                return;
+            }
+            continue;
+        }
+        http.end();
+    }
+}
+
 // ============================================================
 // LVGL Callbacks
 // ============================================================
 
 static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_p)
 {
-    esp_lcd_panel_draw_bitmap(s_panel_handle,
-                              area->x1, area->y1,
-                              area->x2 + 1, area->y2 + 1,
-                              color_p);
+    // Single-buffer mode (num_fbs=1): DMA always reads buf1 via the bounce-buffer
+    // pipeline — there is no DMA pointer swap.  We still call draw_bitmap() on the
+    // last flush because the ESP-IDF RGB driver uses it to trigger a cache-writeback
+    // of the PSRAM region so the bounce-buffer ISR sees fresh pixels.
+    // The vsync wait paces rendering to the display refresh rate (~30 Hz) and
+    // prevents thrashing PSRAM with back-to-back full-frame writes.
     if (lv_disp_flush_is_last(drv))
     {
-        // Espressif esp_lvgl_port pattern for double-buffer RGB panels:
-        // drain any stale vsync token accumulated since the last frame,
-        // then block until the vsync that performs the DMA pointer swap.
-        // draw_bitmap() queues the swap for the NEXT vsync; the drain
-        // removes tokens from vsyncs BEFORE that, so we always wake on
-        // exactly the swap vsync.  flush_ready() is called here in task
-        // context (safe for LVGL 8) once the swap is confirmed.
+        esp_lcd_panel_draw_bitmap(s_panel_handle,
+                                  area->x1, area->y1,
+                                  area->x2 + 1, area->y2 + 1,
+                                  color_p);
+        // Pace to display refresh: drain any accumulated vsync token, wait for next.
         xSemaphoreTake(s_vsync_sem, 0);             // drain stale token
-        xSemaphoreTake(s_vsync_sem, portMAX_DELAY); // block until swap vsync
+        xSemaphoreTake(s_vsync_sem, portMAX_DELAY); // wait for next vsync
     }
     lv_disp_flush_ready(drv);
 }
@@ -3607,9 +3721,8 @@ static void drawAzimuthalMap()
         map_img_dsc.data_size = MAP_SIZE * MAP_SIZE * sizeof(lv_color_t);
         map_img_dsc.data      = (const uint8_t *)map_buf;
         lv_img_set_src(canvas_map, &map_img_dsc);
-        // Give LVGL 2 timer ticks to propagate the new image into both hardware
-        // framebuffers before we start writing bearing lines directly into them.
-        lv_timer_handler();
+        // Give LVGL one timer tick to propagate the new image into the hardware
+        // framebuffer before we start writing bearing lines directly into it.
         lv_timer_handler();
     }
 }
@@ -3718,9 +3831,9 @@ static void updateBearingLinesDirect()
 
     bool rotOnline = (rotatorBearing >= 0) && (millis() - rotatorLastUpdate < 60000);
 
-    for (int fb_idx = 0; fb_idx < 2; fb_idx++)
+    // Single framebuffer — write directly to buf1 only.
     {
-        lv_color_t *fb = (fb_idx == 0) ? buf1 : buf2;
+        lv_color_t *fb = buf1;
 
         // Restore clean map rows from base (erases old bearing line, keeps labels)
         for (int row = 0; row < MAP_SIZE; row++)
@@ -4061,6 +4174,7 @@ static void create_power_tab(lv_obj_t *parent)
     lv_obj_set_style_pad_all(cards_row, 4, 0);
     lv_obj_set_style_bg_opa(cards_row, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(cards_row, 0, 0);
+    lv_obj_clear_flag(cards_row, LV_OBJ_FLAG_SCROLLABLE);
 
     // Battery 1 card
     lv_obj_t *bat1_card = lv_obj_create(cards_row);
@@ -4071,6 +4185,7 @@ static void create_power_tab(lv_obj_t *parent)
     lv_obj_set_style_bg_color(bat1_card, lv_color_hex(0x1a2128), 0);
     lv_obj_set_style_border_color(bat1_card, lv_color_hex(0x2b3541), 0);
     lv_obj_set_style_radius(bat1_card, 12, 0);
+    lv_obj_clear_flag(bat1_card, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *bat1_title = lv_label_create(bat1_card);
     lv_label_set_text(bat1_title, "Battery 1");
@@ -4108,6 +4223,7 @@ static void create_power_tab(lv_obj_t *parent)
     lv_obj_set_style_bg_color(bat2_card, lv_color_hex(0x1a2128), 0);
     lv_obj_set_style_border_color(bat2_card, lv_color_hex(0x2b3541), 0);
     lv_obj_set_style_radius(bat2_card, 12, 0);
+    lv_obj_clear_flag(bat2_card, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *bat2_title = lv_label_create(bat2_card);
     lv_label_set_text(bat2_title, "Battery 2");
@@ -4145,6 +4261,7 @@ static void create_power_tab(lv_obj_t *parent)
     lv_obj_set_style_bg_color(mppt_card, lv_color_hex(0x1a2128), 0);
     lv_obj_set_style_border_color(mppt_card, lv_color_hex(0x2b3541), 0);
     lv_obj_set_style_radius(mppt_card, 12, 0);
+    lv_obj_clear_flag(mppt_card, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *mppt_title = lv_label_create(mppt_card);
     lv_label_set_text(mppt_title, "Solar");
@@ -4173,6 +4290,7 @@ static void create_power_tab(lv_obj_t *parent)
     lv_obj_set_style_bg_color(signal_card, lv_color_hex(0x1a2128), 0);
     lv_obj_set_style_border_color(signal_card, lv_color_hex(0x2b3541), 0);
     lv_obj_set_style_radius(signal_card, 12, 0);
+    lv_obj_clear_flag(signal_card, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *signal_title = lv_label_create(signal_card);
     lv_label_set_text(signal_title, "LoRa Local");
@@ -4210,6 +4328,7 @@ static void create_power_tab(lv_obj_t *parent)
     lv_obj_set_style_bg_color(remote_signal_card, lv_color_hex(0x1a2128), 0);
     lv_obj_set_style_border_color(remote_signal_card, lv_color_hex(0x2b3541), 0);
     lv_obj_set_style_radius(remote_signal_card, 12, 0);
+    lv_obj_clear_flag(remote_signal_card, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *remote_signal_title = lv_label_create(remote_signal_card);
     lv_label_set_text(remote_signal_title, "LoRa Remote");
@@ -4247,6 +4366,7 @@ static void create_power_tab(lv_obj_t *parent)
     lv_obj_set_style_pad_gap(all_row, 12, 0);
     lv_obj_set_style_bg_opa(all_row, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(all_row, 0, 0);
+    lv_obj_clear_flag(all_row, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *btn_all_on = lv_btn_create(all_row);
     btn_all_on_g = btn_all_on;
@@ -4291,6 +4411,7 @@ static void create_power_tab(lv_obj_t *parent)
     lv_obj_set_style_pad_gap(relay_grid, 8, 0);
     lv_obj_set_style_bg_opa(relay_grid, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(relay_grid, 0, 0);
+    lv_obj_clear_flag(relay_grid, LV_OBJ_FLAG_SCROLLABLE);
 
     for (int i = 0; i < 6; i++)
     {
@@ -4324,6 +4445,152 @@ static void create_power_tab(lv_obj_t *parent)
     lv_obj_set_style_text_font(lbl_power_status, &lv_font_montserrat_12, 0);
     lv_obj_set_size(lbl_power_status, LV_PCT(100), 18);
     lv_label_set_long_mode(lbl_power_status, LV_LABEL_LONG_CLIP);
+
+    // WiFi link row — House card | ⚡ bolt | Paddock card
+    // Outer container matches relay_grid padding so card edges align with relay buttons.
+    lv_obj_t *wifi_row = lv_obj_create(parent);
+    lv_obj_set_size(wifi_row, LV_PCT(100), 164);
+    lv_obj_set_flex_flow(wifi_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(wifi_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(wifi_row, 4, 0);
+    lv_obj_set_style_pad_gap(wifi_row, 8, 0);
+    lv_obj_set_style_bg_opa(wifi_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(wifi_row, 0, 0);
+    lv_obj_clear_flag(wifi_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Build one card helper: i=0 House, i=1 Paddock
+    lv_obj_t *wifi_cards[2];
+    for (int i = 0; i < 2; i++)
+    {
+        lv_obj_t *card = lv_obj_create(wifi_row);
+        wifi_cards[i] = card;
+        lv_obj_set_flex_grow(card, 1);
+        lv_obj_set_height(card, 156);
+        lv_obj_set_flex_flow(card, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_all(card, 8, 0);
+        lv_obj_set_style_pad_gap(card, 8, 0);
+        lv_obj_set_style_bg_color(card, lv_color_hex(0x1a2128), 0);
+        lv_obj_set_style_border_color(card, lv_color_hex(0x2b3541), 0);
+        lv_obj_set_style_border_width(card, 0, 0);
+        lv_obj_set_style_radius(card, 12, 0);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+        // Left: text info column
+        lv_obj_t *info = lv_obj_create(card);
+        lv_obj_set_flex_grow(info, 1);
+        lv_obj_set_height(info, 140);
+        lv_obj_set_flex_flow(info, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_all(info, 0, 0);
+        lv_obj_set_style_pad_gap(info, 3, 0);
+        lv_obj_set_style_bg_opa(info, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(info, 0, 0);
+        lv_obj_clear_flag(info, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *title = lv_label_create(info);
+        lv_label_set_text(title, i == 0 ? "WiFi House" : "WiFi Paddock");
+        lv_obj_set_style_text_color(title, lv_color_hex(0x8fa0ae), 0);
+        lv_obj_set_style_text_font(title, &lv_font_montserrat_12, 0);
+
+        lv_obj_t *rssi_l = lv_label_create(info);
+        lv_label_set_text(rssi_l, "-- dBm");
+        lv_obj_set_style_text_font(rssi_l, &lv_font_montserrat_24, 0);
+        lv_obj_set_style_text_color(rssi_l, lv_color_hex(0x888888), 0);
+        lv_obj_set_size(rssi_l, LV_PCT(100), 32);
+        lv_label_set_long_mode(rssi_l, LV_LABEL_LONG_CLIP);
+
+        lv_obj_t *snr_l = lv_label_create(info);
+        lv_label_set_text(snr_l, "SNR: -- dB");
+        lv_obj_set_style_text_font(snr_l, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(snr_l, lv_color_hex(0x888888), 0);
+        lv_obj_set_size(snr_l, LV_PCT(100), 18);
+        lv_label_set_long_mode(snr_l, LV_LABEL_LONG_CLIP);
+
+        lv_obj_t *sig_bar = lv_bar_create(info);
+        lv_obj_set_size(sig_bar, LV_PCT(100), 10);
+        lv_bar_set_range(sig_bar, 0, 100);
+        lv_bar_set_value(sig_bar, 0, LV_ANIM_OFF);
+        lv_obj_set_style_bg_color(sig_bar, lv_color_hex(0x333333), LV_PART_MAIN);
+        lv_obj_set_style_bg_color(sig_bar, lv_color_hex(0x888888), LV_PART_INDICATOR);
+        lv_obj_set_style_radius(sig_bar, 4, LV_PART_MAIN);
+        lv_obj_set_style_radius(sig_bar, 4, LV_PART_INDICATOR);
+
+        lv_obj_t *tx_l = lv_label_create(info);
+        lv_label_set_text(tx_l, "TX: -- Mbps");
+        lv_obj_set_style_text_font(tx_l, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(tx_l, lv_color_hex(0x4caf50), 0);
+        lv_label_set_long_mode(tx_l, LV_LABEL_LONG_CLIP);
+
+        lv_obj_t *rx_l = lv_label_create(info);
+        lv_label_set_text(rx_l, "RX: -- Mbps");
+        lv_obj_set_style_text_font(rx_l, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(rx_l, lv_color_hex(0x42a5f5), 0);
+        lv_label_set_long_mode(rx_l, LV_LABEL_LONG_CLIP);
+
+        // Right: bandwidth gauge (0–140 Mbps, two needles — prop-panel style)
+        lv_obj_t *m = lv_meter_create(card);
+        lv_obj_set_size(m, 140, 140);
+        lv_obj_set_style_bg_color(m, lv_color_hex(0x0d1117), 0);
+        lv_obj_set_style_border_width(m, 0, 0);
+        lv_obj_set_style_text_font(m, &lv_font_montserrat_12, LV_PART_TICKS);
+        lv_obj_set_style_text_color(m, lv_color_hex(0xcccccc), LV_PART_TICKS);
+
+        lv_meter_scale_t *sc = lv_meter_add_scale(m);
+        lv_meter_set_scale_range(m, sc, 0, 140, 270, 135);
+        lv_meter_set_scale_ticks(m, sc, 29, 1, 6, lv_color_hex(0x505050));
+        lv_meter_set_scale_major_ticks(m, sc, 7, 2, 14, lv_color_hex(0xcccccc), 4);
+
+        // Background colour arcs: red → amber → green (same palette as solar gauges)
+        lv_meter_indicator_t *arc_lo = lv_meter_add_arc(m, sc, 13, lv_color_hex(0xf44336), 0);
+        lv_meter_set_indicator_start_value(m, arc_lo, 0);
+        lv_meter_set_indicator_end_value(m, arc_lo, 47);
+        lv_meter_indicator_t *arc_mi = lv_meter_add_arc(m, sc, 13, lv_color_hex(0xff9800), 0);
+        lv_meter_set_indicator_start_value(m, arc_mi, 47);
+        lv_meter_set_indicator_end_value(m, arc_mi, 93);
+        lv_meter_indicator_t *arc_hi = lv_meter_add_arc(m, sc, 13, lv_color_hex(0x4caf50), 0);
+        lv_meter_set_indicator_start_value(m, arc_hi, 93);
+        lv_meter_set_indicator_end_value(m, arc_hi, 140);
+
+        // TX needle (green, thicker — link rate / potential bandwidth)
+        lv_meter_indicator_t *n_tx = lv_meter_add_needle_line(m, sc, 3, lv_color_hex(0x4caf50), -10);
+        // RX needle (blue, thinner — received rate / used bandwidth)
+        lv_meter_indicator_t *n_rx = lv_meter_add_needle_line(m, sc, 2, lv_color_hex(0x42a5f5), -8);
+
+        if (i == 0)
+        {
+            lbl_wifi_house_rssi  = rssi_l;
+            lbl_wifi_house_snr   = snr_l;
+            lbl_wifi_house_tx    = tx_l;
+            lbl_wifi_house_rx    = rx_l;
+            bar_wifi_house_sig   = sig_bar;
+            meter_wifi_house     = m;
+            indic_house_tx       = n_tx;
+            indic_house_rx       = n_rx;
+        }
+        else
+        {
+            lbl_wifi_pad_rssi   = rssi_l;
+            lbl_wifi_pad_snr    = snr_l;
+            lbl_wifi_pad_tx     = tx_l;
+            lbl_wifi_pad_rx     = rx_l;
+            bar_wifi_pad_sig    = sig_bar;
+            meter_wifi_pad      = m;
+            indic_pad_tx        = n_tx;
+            indic_pad_rx        = n_rx;
+        }
+
+        // Insert lightning bolt between the two cards (after house card, before paddock card)
+        if (i == 0)
+        {
+            lbl_link_bolt = lv_label_create(wifi_row);
+            lv_label_set_text(lbl_link_bolt, LV_SYMBOL_CHARGE);
+            lv_obj_set_size(lbl_link_bolt, 28, LV_SIZE_CONTENT);
+            lv_obj_set_style_text_color(lbl_link_bolt, lv_color_hex(0x444444), 0);
+            lv_obj_set_style_text_align(lbl_link_bolt, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_set_style_text_font(lbl_link_bolt, &lv_font_montserrat_24, 0);
+        }
+    }
+    (void)wifi_cards;
 }
 
 static void create_antennas_tab(lv_obj_t *parent)
@@ -4757,6 +5024,7 @@ static void create_propagation_tab(lv_obj_t *parent)
     lv_obj_set_style_pad_gap(solar_row, 4, 0);
     lv_obj_set_style_bg_opa(solar_row, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(solar_row, 0, 0);
+    lv_obj_clear_flag(solar_row, LV_OBJ_FLAG_SCROLLABLE);
 
     struct PropGaugeDef
     {
@@ -4790,6 +5058,7 @@ static void create_propagation_tab(lv_obj_t *parent)
         lv_obj_set_style_bg_color(card, lv_color_hex(0x1a2128), 0);
         lv_obj_set_style_border_color(card, lv_color_hex(0x2b3541), 0);
         lv_obj_set_style_radius(card, 6, 0);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
         // Meter (gauge dial)
         lv_obj_t *meter = lv_meter_create(card);
@@ -4851,6 +5120,7 @@ static void create_propagation_tab(lv_obj_t *parent)
     lv_obj_set_style_pad_gap(bands_grid, 4, 0);
     lv_obj_set_style_bg_opa(bands_grid, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(bands_grid, 0, 0);
+    lv_obj_clear_flag(bands_grid, LV_OBJ_FLAG_SCROLLABLE);
 
     for (int i = 0; i < PROP_NUM_BANDS; i++)
     {
@@ -4866,6 +5136,7 @@ static void create_propagation_tab(lv_obj_t *parent)
         lv_obj_set_style_border_color(card, lv_color_hex(0x333355), 0);
         lv_obj_set_style_border_width(card, 1, 0);
         lv_obj_set_style_radius(card, 6, 0);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
         // Band name
         lv_obj_t *name = lv_label_create(card);
@@ -4891,6 +5162,7 @@ static void create_propagation_tab(lv_obj_t *parent)
         lv_obj_set_style_pad_gap(bar_cont, 2, 0);
         lv_obj_set_style_bg_opa(bar_cont, LV_OPA_TRANSP, 0);
         lv_obj_set_style_border_width(bar_cont, 0, 0);
+        lv_obj_clear_flag(bar_cont, LV_OBJ_FLAG_SCROLLABLE);
 
         // TX bar (blue — outbound spots)
         prop_band_tx_bar[i] = lv_bar_create(bar_cont);
@@ -4927,6 +5199,7 @@ static void create_propagation_tab(lv_obj_t *parent)
     lv_obj_set_style_pad_gap(footer, 2, 0);
     lv_obj_set_style_bg_opa(footer, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(footer, 0, 0);
+    lv_obj_clear_flag(footer, LV_OBJ_FLAG_SCROLLABLE);
 
     // Row 1: Bz | X-ray | gray line | sunrise/sunset | GeoMag
     prop_footer_solar_lbl = lv_label_create(footer);
@@ -4944,6 +5217,7 @@ static void create_propagation_tab(lv_obj_t *parent)
     lv_obj_set_style_pad_all(footer_row2, 0, 0);
     lv_obj_set_style_bg_opa(footer_row2, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(footer_row2, 0, 0);
+    lv_obj_clear_flag(footer_row2, LV_OBJ_FLAG_SCROLLABLE);
 
     prop_vhf_lbl = lv_label_create(footer_row2);
     lv_label_set_text(prop_vhf_lbl, "");
@@ -4971,10 +5245,14 @@ static void create_ui()
         LV_FONT_DEFAULT);
     lv_disp_set_theme(lv_disp_get_default(), th);
 
+    // Prevent the root screen from being scrolled by unhandled touch events.
+    lv_obj_clear_flag(lv_scr_act(), LV_OBJ_FLAG_SCROLLABLE);
+
     // Create tabview with NO built-in tab bar (height=0) to avoid btnmatrix hit-test
     // issues. We create our own custom tab bar with individual lv_btn objects which
     // have exact, predictable click zones at 1024/5 = ~204px each.
     tabview = lv_tabview_create(lv_scr_act(), LV_DIR_TOP, 0);
+    lv_obj_clear_flag(tabview, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_pos(tabview, 0, 64);
     lv_obj_set_size(tabview, LCD_WIDTH, LCD_HEIGHT - 64);
     // Ensure exact per-tab scroll positions: no padding/gap on content, no snap.
@@ -4985,11 +5263,17 @@ static void create_ui()
     // Disable swipe-to-change on content — our custom buttons handle navigation.
     lv_obj_set_scroll_dir(lv_tabview_get_content(tabview), LV_DIR_NONE);
 
-    tab_overview = lv_tabview_add_tab(tabview, "Overview");
-    tab_power = lv_tabview_add_tab(tabview, "Power");
-    tab_antennas = lv_tabview_add_tab(tabview, "Antennas");
-    tab_rotator = lv_tabview_add_tab(tabview, "Rotator");
+    tab_overview    = lv_tabview_add_tab(tabview, "Overview");
+    tab_power       = lv_tabview_add_tab(tabview, "Power");
+    tab_antennas    = lv_tabview_add_tab(tabview, "Antennas");
+    tab_rotator     = lv_tabview_add_tab(tabview, "Rotator");
     tab_propagation = lv_tabview_add_tab(tabview, "Prop");
+    // Prevent each tab panel from being accidentally scrolled by touch.
+    lv_obj_clear_flag(tab_overview,    LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(tab_power,       LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(tab_antennas,    LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(tab_rotator,     LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(tab_propagation, LV_OBJ_FLAG_SCROLLABLE);
 
     // Custom tab bar — individual lv_btn objects guarantee exact click zones
     lv_obj_t *tab_bar = lv_obj_create(lv_scr_act());
@@ -5512,7 +5796,100 @@ static void update_power_tab()
         else if (!relayDataReady)
             lbl_set(lbl_power_status, "Waiting for relay data...");
         else
-            lbl_set(lbl_power_status, lastStatusMessage.length() > 0 ? lastStatusMessage.c_str() : "Connected");
+            lbl_set(lbl_power_status, lastStatusMessage.length() > 0 ? lastStatusMessage.c_str() : "");
+    }
+
+    // Update WiFi link cards
+    static uint32_t prevLinkVersion = 0xFFFFFFFFu;
+    if (s_linkDataVersion != prevLinkVersion)
+    {
+        prevLinkVersion = s_linkDataVersion;
+
+        struct WifiWidgetSet {
+            lv_obj_t **rssi; lv_obj_t **snr; lv_obj_t **tx; lv_obj_t **rx;
+            lv_obj_t **bar_sig;
+            lv_obj_t **meter; lv_meter_indicator_t **itx; lv_meter_indicator_t **irx;
+        };
+        WifiWidgetSet ws[2] = {
+            { &lbl_wifi_house_rssi, &lbl_wifi_house_snr, &lbl_wifi_house_tx, &lbl_wifi_house_rx,
+              &bar_wifi_house_sig, &meter_wifi_house, &indic_house_tx, &indic_house_rx },
+            { &lbl_wifi_pad_rssi,   &lbl_wifi_pad_snr,   &lbl_wifi_pad_tx,   &lbl_wifi_pad_rx,
+              &bar_wifi_pad_sig,  &meter_wifi_pad,   &indic_pad_tx,   &indic_pad_rx }
+        };
+        const LinkEndpointData *eps[2] = { &s_linkData.house, &s_linkData.paddock };
+        char buf[48];
+
+        for (int i = 0; i < 2; i++)
+        {
+            const LinkEndpointData &ep = *eps[i];
+            WifiWidgetSet &w = ws[i];
+            if (!*w.rssi || !*w.snr || !*w.meter) continue;
+
+            if (ep.connected && s_linkData.valid)
+            {
+                // RSSI (colour + bar matching LoRa band thresholds)
+                snprintf(buf, sizeof(buf), "%d dBm", ep.rssi);
+                lbl_set(*w.rssi, buf);
+                int pct = constrain((ep.rssi + 90) * 2, 0, 100);
+                int8_t band = (pct > 60) ? 3 : (pct > 30) ? 2 : 1;
+                lv_color_t sig_col = (band == 3) ? lv_color_hex(0x4caf50)
+                                   : (band == 2) ? lv_color_hex(0xff9800)
+                                                 : lv_color_hex(0xf44336);
+                lv_obj_set_style_text_color(*w.rssi, sig_col, 0);
+                if (*w.bar_sig)
+                {
+                    lv_bar_set_value(*w.bar_sig, pct, LV_ANIM_OFF);
+                    lv_obj_set_style_bg_color(*w.bar_sig, sig_col, LV_PART_INDICATOR);
+                }
+
+                // SNR (colour by quality)
+                snprintf(buf, sizeof(buf), "SNR %d dB", ep.snr);
+                lbl_set(*w.snr, buf);
+                lv_color_t snr_col = (ep.snr >= 25) ? lv_color_hex(0x4caf50)
+                                   : (ep.snr >= 15) ? lv_color_hex(0xff9800)
+                                                    : lv_color_hex(0xf44336);
+                lv_obj_set_style_text_color(*w.snr, snr_col, 0);
+
+                // TX / RX labels
+                snprintf(buf, sizeof(buf), "TX %d Mbps", ep.txRateMbps);
+                lbl_set(*w.tx, buf);
+                snprintf(buf, sizeof(buf), "RX %d Mbps", ep.rxRateMbps);
+                lbl_set(*w.rx, buf);
+
+                // Gauge needles (clamped to 0–140)
+                int tx_val = constrain(ep.txRateMbps, 0, 140);
+                int rx_val = constrain(ep.rxRateMbps, 0, 140);
+                lv_meter_set_indicator_value(*w.meter, *w.itx, tx_val);
+                lv_meter_set_indicator_value(*w.meter, *w.irx, rx_val);
+            }
+            else
+            {
+                lbl_set(*w.rssi, "-- dBm");
+                lbl_set(*w.snr,  "SNR: -- dB");
+                lbl_set(*w.tx,   "TX: -- Mbps");
+                lbl_set(*w.rx,   "RX: -- Mbps");
+                lv_obj_set_style_text_color(*w.rssi, lv_color_hex(0x888888), 0);
+                lv_obj_set_style_text_color(*w.snr,  lv_color_hex(0x888888), 0);
+                if (*w.bar_sig)
+                {
+                    lv_bar_set_value(*w.bar_sig, 0, LV_ANIM_OFF);
+                    lv_obj_set_style_bg_color(*w.bar_sig, lv_color_hex(0x888888), LV_PART_INDICATOR);
+                }
+                lv_meter_set_indicator_value(*w.meter, *w.itx, 0);
+                lv_meter_set_indicator_value(*w.meter, *w.irx, 0);
+            }
+        }
+
+        // Lightning bolt: yellow = both ends up, grey = only house (or neither)
+        if (lbl_link_bolt)
+        {
+            bool both = s_linkData.house.connected && s_linkData.paddock.connected && s_linkData.valid;
+            bool house_only = s_linkData.house.connected && !s_linkData.paddock.connected && s_linkData.valid;
+            lv_color_t bolt_col = both      ? lv_color_hex(0xffcc00)
+                                : house_only ? lv_color_hex(0xff8800)
+                                             : lv_color_hex(0x444444);
+            lv_obj_set_style_text_color(lbl_link_bolt, bolt_col, 0);
+        }
     }
 }
 
@@ -6465,6 +6842,7 @@ static void pollTaskFn(void *pv)
         pollRotatorFast();
         pollVfoFast();
         pollPropagationProxy();
+        pollLinkMonitor();
         fetchRotatorMemory();
         if (tciEnabled)
             TCIService.loop();
@@ -6554,13 +6932,11 @@ void setup()
     // Initialize LVGL
     lv_init();
 
-    // Two PSRAM frame buffers: LVGL renders into the back buffer while DMA scans
-    // the front buffer.  They swap at vsync via esp_lcd_panel_draw_bitmap(), which
-    // detects the internal FB address and does a pointer flip rather than a memcpy.
-    // full_refresh=1 ensures the back buffer is always a complete frame (required
-    // with double-buffer so unchanged regions are never left with stale content).
-    ESP_ERROR_CHECK(esp_lcd_rgb_panel_get_frame_buffer(s_panel_handle, 2, (void **)&buf1, (void **)&buf2));
-    lv_disp_draw_buf_init(&draw_buf, buf1, buf2, LCD_WIDTH * LCD_HEIGHT);
+    // Single PSRAM frame buffer: DMA always reads buf1 via the bounce buffer pipeline.
+    // No double-buffer swap means no vsync pointer-flip race that caused the
+    // "content shift / top wraps to bottom" display artifact.
+    ESP_ERROR_CHECK(esp_lcd_rgb_panel_get_frame_buffer(s_panel_handle, 1, (void **)&buf1));
+    lv_disp_draw_buf_init(&draw_buf, buf1, NULL, LCD_WIDTH * LCD_HEIGHT);
 
     lv_disp_drv_init(&disp_drv);
     disp_drv.hor_res = LCD_WIDTH;
