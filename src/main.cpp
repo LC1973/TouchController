@@ -676,6 +676,10 @@ static lv_obj_t *antenna_group_rows[3] = {nullptr};
 static lv_obj_t *antenna_group_labels[3] = {nullptr}; // group name labels
 static lv_obj_t *lbl_vfo_a = nullptr;                 // VFO-A frequency display
 static lv_obj_t *lbl_vfo_b = nullptr;                 // VFO-B frequency display
+static lv_obj_t *band_tile_a = nullptr;               // band indicator card for VFO-A
+static lv_obj_t *band_lbl_a  = nullptr;
+static lv_obj_t *band_tile_b = nullptr;               // band indicator card for VFO-B
+static lv_obj_t *band_lbl_b  = nullptr;
 static double antennaVfoA = 0.0;                      // MHz from TCI
 static double antennaVfoB = 0.0;
 static bool antennaTciConnected = false;
@@ -901,6 +905,13 @@ static const PropBandInfo propBands[PROP_NUM_BANDS] = {
     {"2m", 144000000, 148000000, -1},
 };
 
+struct PSKBandData
+{
+    int maxTxKm  = 0;
+    int maxRxKm  = 0;
+    char condition[12] = "";
+};
+
 struct SolarPropData
 {
     int sfi = 0;
@@ -913,10 +924,26 @@ struct SolarPropData
     char hfCondNight[4][12] = {{0}, {0}, {0}, {0}};
     char vhfESkipEU[24] = "";
     char vhfAurora[24] = "";
+    // PSK Reporter per-band data (index matches propBands[])
+    PSKBandData psk[PROP_NUM_BANDS] = {};
+    // Space weather (NOAA SWPC, 1-min cadence)
+    bool  recentlyDisturbed = false;
+    float bz = 0.0f;
+    int   bzAgeSeconds = -1;
+    char  xrayClass[12] = "";
+    int   xrayAgeSeconds = -1;
+    // Gray line (server-computed from home QTH)
+    char sunriseUtc[8] = "";
+    char sunsetUtc[8]  = "";
+    int  minsToGrayLine = 0;
+    // Data age (server-reported)
+    int  ageSeconds    = -1;
+    int  pskAgeSeconds = -1;
     bool valid = false;
     unsigned long lastUpdate = 0;
 };
 static SolarPropData solarData;
+static uint32_t s_propDataVersion = 0;  // incremented each time prop data is parsed
 
 static RotatorMemoryPoint rotatorMemories[3][MEM_PER_GROUP] = {
     // UK (bearings from G7NRU, Leadenham, Lincs)
@@ -986,13 +1013,62 @@ static void parsePropagationPayload(const JsonDocument &doc)
     if (root["signalNoise"])
         copyText(solarData.signalNoise, sizeof(solarData.signalNoise), root["signalNoise"].as<String>());
 
+    // Space weather
+    if (!root["recentlyDisturbed"].isNull())
+        solarData.recentlyDisturbed = root["recentlyDisturbed"].as<bool>();
+    if (!root["bz"].isNull())
+        solarData.bz = root["bz"].as<float>();
+    if (!root["bzAgeSeconds"].isNull())
+        solarData.bzAgeSeconds = root["bzAgeSeconds"].as<int>();
+    if (root["xrayClass"])
+        copyText(solarData.xrayClass, sizeof(solarData.xrayClass), root["xrayClass"].as<String>());
+    if (!root["xrayAgeSeconds"].isNull())
+        solarData.xrayAgeSeconds = root["xrayAgeSeconds"].as<int>();
+
+    // Gray line (computed server-side from home QTH coordinates)
+    if (root["sunriseUtc"])
+        copyText(solarData.sunriseUtc, sizeof(solarData.sunriseUtc), root["sunriseUtc"].as<String>());
+    if (root["sunsetUtc"])
+        copyText(solarData.sunsetUtc, sizeof(solarData.sunsetUtc), root["sunsetUtc"].as<String>());
+    if (!root["minsToGrayLine"].isNull())
+        solarData.minsToGrayLine = root["minsToGrayLine"].as<int>();
+
+    // Server-reported data age
+    if (!root["ageSeconds"].isNull())
+        solarData.ageSeconds = root["ageSeconds"].as<int>();
+    if (!root["pskAgeSeconds"].isNull())
+        solarData.pskAgeSeconds = root["pskAgeSeconds"].as<int>();
+
+    // PSK Reporter per-band propagation (object keyed by band name, e.g. "20m")
+    if (root["propagation"].is<JsonObjectConst>())
+    {
+        JsonObjectConst prop = root["propagation"].as<JsonObjectConst>();
+        for (int i = 0; i < PROP_NUM_BANDS; i++)
+        {
+            JsonVariantConst b = prop[propBands[i].name];
+            if (!b.isNull())
+            {
+                if (!b["maxTxKm"].isNull())
+                    solarData.psk[i].maxTxKm = b["maxTxKm"].as<int>();
+                if (!b["maxRxKm"].isNull())
+                    solarData.psk[i].maxRxKm = b["maxRxKm"].as<int>();
+                if (b["condition"])
+                    copyText(solarData.psk[i].condition, sizeof(solarData.psk[i].condition),
+                             b["condition"].as<String>());
+            }
+        }
+    }
+
     solarData.valid = true;
     solarData.lastUpdate = millis();
+    s_propDataVersion++;
 }
 
 // Propagation tab UI
-static lv_obj_t *prop_band_cards[PROP_NUM_BANDS] = {nullptr};
+static lv_obj_t *prop_band_cards[PROP_NUM_BANDS]    = {nullptr};
 static lv_obj_t *prop_band_cond_lbl[PROP_NUM_BANDS] = {nullptr};
+static lv_obj_t *prop_band_tx_bar[PROP_NUM_BANDS]   = {nullptr};  // TX km bar
+static lv_obj_t *prop_band_rx_bar[PROP_NUM_BANDS]   = {nullptr};  // RX km bar
 static lv_obj_t *prop_sfi_val = nullptr;
 static lv_obj_t *prop_k_val = nullptr;
 static lv_obj_t *prop_a_val = nullptr;
@@ -1005,8 +1081,9 @@ static lv_meter_indicator_t *prop_sfi_needle = nullptr;
 static lv_meter_indicator_t *prop_k_needle = nullptr;
 static lv_meter_indicator_t *prop_a_needle = nullptr;
 static lv_meter_indicator_t *prop_ssn_needle = nullptr;
-static lv_obj_t *prop_vhf_lbl = nullptr;
-static lv_obj_t *prop_updated_lbl = nullptr;
+static lv_obj_t *prop_footer_solar_lbl = nullptr;  // Bz, X-ray, gray line, sunrise/sunset
+static lv_obj_t *prop_vhf_lbl = nullptr;            // Es, Aurora, S/N
+static lv_obj_t *prop_updated_lbl = nullptr;        // data freshness
 
 // Find a reachable LoRa gateway/remote peer
 // Prefer the remote (paddock) gateway - it's the direct controller and faster.
@@ -1512,9 +1589,11 @@ static void pollPropagationProxy()
     {
         int count = peerDiscovery.peerCount();
         const DiscoveredPeer *peers = peerDiscovery.peers();
+        debugLogf("[PROP] poll: %d total peers", count);
         for (int i = 0; i < count && snapCount < PeerDiscovery::MAX_PEERS; i++)
         {
             const DiscoveredPeer &p = peers[i];
+            debugLogf("[PROP] peer[%d] name=%s role=%s ip=%s port=%d", i, p.name, p.role, p.ip, p.port);
             if (!strlen(p.ip))
                 continue;
             bool isPropPeer = strstr(p.role, "prop") != nullptr || strstr(p.name, "propproxy") != nullptr || strstr(p.name, "pi5") != nullptr;
@@ -1527,6 +1606,7 @@ static void pollPropagationProxy()
     }
     xSemaphoreGive(g_dataMutex);
 
+    debugLogf("[PROP] snapCount=%d", snapCount);
     for (int s = 0; s < snapCount; s++)
     {
         HTTPClient http;
@@ -1534,22 +1614,30 @@ static void pollPropagationProxy()
         String urls[2] = {base + "/api/propagation", base + "/api/status"};
         for (int u = 0; u < 2; u++)
         {
+            debugLogf("[PROP] GET %s", urls[u].c_str());
             http.setTimeout(HTTP_TIMEOUT_PROP_MS);
             if (!http.begin(urls[u]))
+            {
+                debugLog("[PROP] begin() failed");
                 continue;
+            }
             int code = http.GET();
+            debugLogf("[PROP] HTTP %d", code);
             if (code == 200)
             {
                 String body = http.getString();
                 http.end();
                 JsonDocument doc;
-                if (!deserializeJson(doc, body))
+                DeserializationError err = deserializeJson(doc, body);
+                if (!err)
                 {
                     xSemaphoreTake(g_dataMutex, portMAX_DELAY);
                     parsePropagationPayload(doc);
                     xSemaphoreGive(g_dataMutex);
+                    debugLogf("[PROP] parsed OK, sfi=%d valid=%d", doc["sfi"].as<int>(), doc["valid"].as<bool>());
                     return;
                 }
+                debugLogf("[PROP] JSON parse error: %s", err.c_str());
                 continue;
             }
             http.end();
@@ -2313,6 +2401,13 @@ void setupWebServer()
     server.on("/log", handleLogPage);
     server.on("/clearlog", HTTP_GET, handleClearLog);
     server.on("/api/status", handleStatusApi);
+    // Receive push notification from antenna-controller on antenna change.
+    // Resets the VFO poll timer so the next loop() iteration fetches immediately.
+    server.on("/api/notify", HTTP_POST, []() {
+        if (server.hasArg("role") && server.arg("role").indexOf("antenna") >= 0)
+            lastVfoPoll = 0;
+        server.send(200, "application/json", "{\"ok\":true}");
+    });
     server.on("/reboot", handleReboot);
     server.on("/download_config", HTTP_GET, handleDownloadConfig);
 
@@ -4252,34 +4347,67 @@ static void create_antennas_tab(lv_obj_t *parent)
     lv_obj_t *vfo_bar = lv_obj_create(parent);
     lv_obj_set_size(vfo_bar, LV_PCT(100), VFO_BAR_H);
     lv_obj_set_flex_flow(vfo_bar, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(vfo_bar, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_hor(vfo_bar, 16, 0);
+    lv_obj_set_flex_align(vfo_bar, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_hor(vfo_bar, 8, 0);
     lv_obj_set_style_pad_ver(vfo_bar, 0, 0);
+    lv_obj_set_style_pad_gap(vfo_bar, 8, 0);
     lv_obj_set_style_bg_color(vfo_bar, lv_color_hex(0x050500), 0); // near-black amber tint
     lv_obj_set_style_border_color(vfo_bar, lv_color_hex(0x6B4800), 0);
     lv_obj_set_style_border_width(vfo_bar, 2, 0);
     lv_obj_set_style_radius(vfo_bar, 8, 0);
     lv_obj_clear_flag(vfo_bar, LV_OBJ_FLAG_SCROLLABLE);
 
-    // VFO labels — explicit fixed size prevents LV_SIZE_CONTENT cascade repaints
-    static const lv_coord_t VFO_LBL_W = (lv_coord_t)((LCD_WIDTH - 20 - 32) / 2 - 8);
+    // Each VFO slot: [band_tile (62 px fixed)] + [freq label (flex_grow)]
+    // Tile is green on amateur/CB, red+OOB otherwise.
+    static const lv_coord_t TILE_W   = 62;
+    static const lv_coord_t TILE_H   = (lv_coord_t)(VFO_BAR_H - 12);
     static const lv_coord_t VFO_LBL_H = (lv_coord_t)(VFO_BAR_H - 8);
 
-    lbl_vfo_a = lv_label_create(vfo_bar);
-    lv_obj_set_size(lbl_vfo_a, VFO_LBL_W, VFO_LBL_H);
-    lv_label_set_long_mode(lbl_vfo_a, LV_LABEL_LONG_CLIP);
-    lv_label_set_text(lbl_vfo_a, "VFO A: ---.--- MHz");
-    lv_obj_set_style_text_font(lbl_vfo_a, &lv_font_montserrat_36, 0);
-    lv_obj_set_style_text_color(lbl_vfo_a, lv_color_hex(0x40E060), 0); // green
-    lv_obj_set_style_text_align(lbl_vfo_a, LV_TEXT_ALIGN_CENTER, 0);
+    for (int v = 0; v < 2; v++)
+    {
+        lv_obj_t *grp = lv_obj_create(vfo_bar);
+        lv_obj_set_height(grp, VFO_BAR_H);
+        lv_obj_set_flex_grow(grp, 1);
+        lv_obj_set_flex_flow(grp, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(grp, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_hor(grp, 4, 0);
+        lv_obj_set_style_pad_ver(grp, 0, 0);
+        lv_obj_set_style_pad_gap(grp, 6, 0);
+        lv_obj_set_style_bg_opa(grp, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(grp, 0, 0);
+        lv_obj_clear_flag(grp, LV_OBJ_FLAG_SCROLLABLE);
 
-    lbl_vfo_b = lv_label_create(vfo_bar);
-    lv_obj_set_size(lbl_vfo_b, VFO_LBL_W, VFO_LBL_H);
-    lv_label_set_long_mode(lbl_vfo_b, LV_LABEL_LONG_CLIP);
-    lv_label_set_text(lbl_vfo_b, "VFO B: ---.--- MHz");
-    lv_obj_set_style_text_font(lbl_vfo_b, &lv_font_montserrat_36, 0);
-    lv_obj_set_style_text_color(lbl_vfo_b, lv_color_hex(0x40E060), 0); // green
-    lv_obj_set_style_text_align(lbl_vfo_b, LV_TEXT_ALIGN_CENTER, 0);
+        // Band indicator tile
+        lv_obj_t *tile = lv_obj_create(grp);
+        lv_obj_set_size(tile, TILE_W, TILE_H);
+        lv_obj_set_flex_flow(tile, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(tile, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_all(tile, 2, 0);
+        lv_obj_set_style_bg_color(tile, lv_color_hex(0x1a1a1a), 0);
+        lv_obj_set_style_border_color(tile, lv_color_hex(0x444444), 0);
+        lv_obj_set_style_border_width(tile, 2, 0);
+        lv_obj_set_style_radius(tile, 6, 0);
+        lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *tileLbl = lv_label_create(tile);
+        lv_label_set_text(tileLbl, "--");
+        lv_obj_set_style_text_font(tileLbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(tileLbl, lv_color_hex(0x888888), 0);
+        lv_obj_set_style_text_align(tileLbl, LV_TEXT_ALIGN_CENTER, 0);
+
+        // Frequency label
+        lv_obj_t *freqLbl = lv_label_create(grp);
+        lv_obj_set_height(freqLbl, VFO_LBL_H);
+        lv_obj_set_flex_grow(freqLbl, 1);
+        lv_label_set_long_mode(freqLbl, LV_LABEL_LONG_CLIP);
+        lv_label_set_text(freqLbl, v == 0 ? "VFO A: ---.--- MHz" : "VFO B: ---.--- MHz");
+        lv_obj_set_style_text_font(freqLbl, &lv_font_montserrat_36, 0);
+        lv_obj_set_style_text_color(freqLbl, lv_color_hex(0x40E060), 0);
+        lv_obj_set_style_text_align(freqLbl, LV_TEXT_ALIGN_LEFT, 0);
+
+        if (v == 0) { lbl_vfo_a = freqLbl; band_tile_a = tile; band_lbl_a = tileLbl; }
+        else        { lbl_vfo_b = freqLbl; band_tile_b = tile; band_lbl_b = tileLbl; }
+    }
 
     // 3-column container — fixed height so no child can force a re-layout
     lv_obj_t *cols = lv_obj_create(parent);
@@ -4622,7 +4750,7 @@ static void create_propagation_tab(lv_obj_t *parent)
     // Solar gauge row - 4 dials
     // Solar gauge row - 4 dials with green/amber/red zones
     lv_obj_t *solar_row = lv_obj_create(parent);
-    lv_obj_set_size(solar_row, LV_PCT(100), 232);
+    lv_obj_set_size(solar_row, LV_PCT(100), 220);
     lv_obj_set_flex_flow(solar_row, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(solar_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_all(solar_row, 1, 0);
@@ -4654,7 +4782,7 @@ static void create_propagation_tab(lv_obj_t *parent)
     for (int i = 0; i < 4; i++)
     {
         lv_obj_t *card = lv_obj_create(solar_row);
-        lv_obj_set_size(card, LV_PCT(24), 230);
+        lv_obj_set_size(card, LV_PCT(24), 218);
         lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
         lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_set_style_pad_all(card, 4, 0);
@@ -4711,12 +4839,13 @@ static void create_propagation_tab(lv_obj_t *parent)
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
     }
 
-    // Band cards grid - 4 columns, 4 rows
+    // Band cards grid — 4 columns x 3 rows.
+    // Each tile: band name / condition (PSK-derived) / TX-RX distances.
     lv_obj_t *bands_grid = lv_obj_create(parent);
-    lv_obj_set_size(bands_grid, LV_PCT(100), 226);
+    lv_obj_set_size(bands_grid, LV_PCT(100), 250);
     lv_obj_set_layout(bands_grid, LV_LAYOUT_GRID);
     static lv_coord_t bcol[] = {LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_TEMPLATE_LAST};
-    static lv_coord_t brow[] = {72, 72, 72, LV_GRID_TEMPLATE_LAST};
+    static lv_coord_t brow[] = {80, 80, 80, LV_GRID_TEMPLATE_LAST};
     lv_obj_set_grid_dsc_array(bands_grid, bcol, brow);
     lv_obj_set_style_pad_all(bands_grid, 1, 0);
     lv_obj_set_style_pad_gap(bands_grid, 4, 0);
@@ -4728,11 +4857,11 @@ static void create_propagation_tab(lv_obj_t *parent)
         lv_obj_t *card = lv_obj_create(bands_grid);
         lv_obj_set_grid_cell(card, LV_GRID_ALIGN_STRETCH, i % 4, 1,
                              LV_GRID_ALIGN_STRETCH, i / 4, 1);
-        lv_obj_set_height(card, 72);
+        lv_obj_set_height(card, 80);
         lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
         lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-        lv_obj_set_style_pad_all(card, 1, 0);
-        lv_obj_set_style_pad_gap(card, 0, 0);
+        lv_obj_set_style_pad_all(card, 2, 0);
+        lv_obj_set_style_pad_gap(card, 1, 0);
         lv_obj_set_style_bg_color(card, lv_color_hex(0x1a1a2e), 0);
         lv_obj_set_style_border_color(card, lv_color_hex(0x333355), 0);
         lv_obj_set_style_border_width(card, 1, 0);
@@ -4744,40 +4873,92 @@ static void create_propagation_tab(lv_obj_t *parent)
         lv_obj_set_style_text_font(name, &lv_font_montserrat_16, 0);
         lv_obj_set_style_text_color(name, lv_color_hex(0xdddddd), 0);
 
-        // Condition text
+        // Condition text — Good/Fair/Poor from PSK, or hamqsl HF groups, or VHF status
         prop_band_cond_lbl[i] = lv_label_create(card);
         lv_label_set_text(prop_band_cond_lbl[i], "");
-        lv_obj_set_style_text_font(prop_band_cond_lbl[i], &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_font(prop_band_cond_lbl[i], &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(prop_band_cond_lbl[i], lv_color_hex(0x888888), 0);
-        lv_obj_set_size(prop_band_cond_lbl[i], LV_PCT(100), 20);
+        lv_obj_set_size(prop_band_cond_lbl[i], LV_PCT(100), 18);
         lv_label_set_long_mode(prop_band_cond_lbl[i], LV_LABEL_LONG_CLIP);
         lv_obj_set_style_text_align(prop_band_cond_lbl[i], LV_TEXT_ALIGN_CENTER, 0);
+
+        // TX / RX mini bar charts (PSK Reporter spot distances)
+        lv_obj_t *bar_cont = lv_obj_create(card);
+        lv_obj_set_size(bar_cont, LV_PCT(96), 20);
+        lv_obj_set_flex_flow(bar_cont, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(bar_cont, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_all(bar_cont, 0, 0);
+        lv_obj_set_style_pad_gap(bar_cont, 2, 0);
+        lv_obj_set_style_bg_opa(bar_cont, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(bar_cont, 0, 0);
+
+        // TX bar (blue — outbound spots)
+        prop_band_tx_bar[i] = lv_bar_create(bar_cont);
+        lv_obj_set_size(prop_band_tx_bar[i], LV_PCT(100), 7);
+        lv_bar_set_range(prop_band_tx_bar[i], 0, 20000);
+        lv_bar_set_value(prop_band_tx_bar[i], 0, LV_ANIM_OFF);
+        lv_obj_set_style_bg_color(prop_band_tx_bar[i], lv_color_hex(0x0d2233), 0);
+        lv_obj_set_style_bg_opa(prop_band_tx_bar[i], LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(prop_band_tx_bar[i], lv_color_hex(0x1565c0), LV_PART_INDICATOR);
+        lv_obj_set_style_bg_opa(prop_band_tx_bar[i], LV_OPA_COVER, LV_PART_INDICATOR);
+        lv_obj_set_style_radius(prop_band_tx_bar[i], 2, 0);
+        lv_obj_set_style_radius(prop_band_tx_bar[i], 2, LV_PART_INDICATOR);
+
+        // RX bar (green — inbound spots)
+        prop_band_rx_bar[i] = lv_bar_create(bar_cont);
+        lv_obj_set_size(prop_band_rx_bar[i], LV_PCT(100), 7);
+        lv_bar_set_range(prop_band_rx_bar[i], 0, 20000);
+        lv_bar_set_value(prop_band_rx_bar[i], 0, LV_ANIM_OFF);
+        lv_obj_set_style_bg_color(prop_band_rx_bar[i], lv_color_hex(0x0d2010), 0);
+        lv_obj_set_style_bg_opa(prop_band_rx_bar[i], LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(prop_band_rx_bar[i], lv_color_hex(0x2e7d32), LV_PART_INDICATOR);
+        lv_obj_set_style_bg_opa(prop_band_rx_bar[i], LV_OPA_COVER, LV_PART_INDICATOR);
+        lv_obj_set_style_radius(prop_band_rx_bar[i], 2, 0);
+        lv_obj_set_style_radius(prop_band_rx_bar[i], 2, LV_PART_INDICATOR);
 
         prop_band_cards[i] = card;
     }
 
-    // VHF conditions + update footer
+    // Two-row footer
     lv_obj_t *footer = lv_obj_create(parent);
-    lv_obj_set_size(footer, LV_PCT(100), 24);
-    lv_obj_set_flex_flow(footer, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(footer, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_size(footer, LV_PCT(100), 44);
+    lv_obj_set_flex_flow(footer, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_all(footer, 2, 0);
+    lv_obj_set_style_pad_gap(footer, 2, 0);
     lv_obj_set_style_bg_opa(footer, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(footer, 0, 0);
 
-    prop_vhf_lbl = lv_label_create(footer);
-    lv_label_set_text(prop_vhf_lbl, "VHF: Loading...");
-    lv_obj_set_style_text_font(prop_vhf_lbl, &lv_font_montserrat_12, 0);
+    // Row 1: Bz | X-ray | gray line | sunrise/sunset | GeoMag
+    prop_footer_solar_lbl = lv_label_create(footer);
+    lv_label_set_text(prop_footer_solar_lbl, "Waiting for space weather...");
+    lv_obj_set_style_text_font(prop_footer_solar_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(prop_footer_solar_lbl, lv_color_hex(0x888888), 0);
+    lv_obj_set_size(prop_footer_solar_lbl, LV_PCT(100), 20);
+    lv_label_set_long_mode(prop_footer_solar_lbl, LV_LABEL_LONG_CLIP);
+
+    // Row 2: VHF Es/Aurora (left) + data freshness (right)
+    lv_obj_t *footer_row2 = lv_obj_create(footer);
+    lv_obj_set_size(footer_row2, LV_PCT(100), 20);
+    lv_obj_set_flex_flow(footer_row2, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(footer_row2, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(footer_row2, 0, 0);
+    lv_obj_set_style_bg_opa(footer_row2, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(footer_row2, 0, 0);
+
+    prop_vhf_lbl = lv_label_create(footer_row2);
+    lv_label_set_text(prop_vhf_lbl, "");
+    lv_obj_set_style_text_font(prop_vhf_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(prop_vhf_lbl, lv_color_hex(0x888888), 0);
-    lv_obj_set_size(prop_vhf_lbl, 700, 20);
+    lv_obj_set_size(prop_vhf_lbl, 660, 20);
     lv_label_set_long_mode(prop_vhf_lbl, LV_LABEL_LONG_CLIP);
 
-    prop_updated_lbl = lv_label_create(footer);
-    lv_label_set_text(prop_updated_lbl, "Loading...");
-    lv_obj_set_style_text_font(prop_updated_lbl, &lv_font_montserrat_12, 0);
+    prop_updated_lbl = lv_label_create(footer_row2);
+    lv_label_set_text(prop_updated_lbl, "");
+    lv_obj_set_style_text_font(prop_updated_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(prop_updated_lbl, lv_color_hex(0x888888), 0);
-    lv_obj_set_size(prop_updated_lbl, 260, 20);
+    lv_obj_set_size(prop_updated_lbl, 340, 20);
     lv_label_set_long_mode(prop_updated_lbl, LV_LABEL_LONG_CLIP);
+    lv_obj_set_style_text_align(prop_updated_lbl, LV_TEXT_ALIGN_RIGHT, 0);
 }
 
 static void create_ui()
@@ -4873,6 +5054,59 @@ static inline void lbl_set(lv_obj_t *lbl, const char *text)
         return;
     if (strcmp(lv_label_get_text(lbl), text) != 0)
         lv_label_set_text(lbl, text);
+}
+
+// Return the amateur/CB band name for a frequency in MHz, or "OOB" if out of band.
+static const char *freqGetBandName(float mhz, bool &inBand)
+{
+    static const struct { float lo, hi; const char *n; } bands[] = {
+        {0.1357f, 0.1378f, "2200m"},
+        {0.472f,  0.479f,  "630m"},
+        {1.8f,    2.0f,    "160m"},
+        {3.5f,    4.0f,    "80m"},
+        {5.351f,  5.367f,  "60m"},
+        {7.0f,    7.3f,    "40m"},
+        {10.1f,   10.15f,  "30m"},
+        {14.0f,   14.35f,  "20m"},
+        {18.068f, 18.168f, "17m"},
+        {21.0f,   21.45f,  "15m"},
+        {24.89f,  24.99f,  "12m"},
+        {26.0f,   28.0f,   "CB"},
+        {28.0f,   29.7f,   "10m"},
+        {50.0f,   54.0f,   "6m"},
+        {70.0f,   70.5f,   "4m"},
+        {144.0f,  148.0f,  "2m"},
+        {430.0f,  440.0f,  "70cm"},
+    };
+    for (const auto &b : bands)
+        if (mhz >= b.lo && mhz < b.hi) { inBand = true; return b.n; }
+    inBand = false;
+    return "OOB";
+}
+
+// Update a band indicator tile — green for amateur/CB, red for OOB, grey when no data.
+static void updateBandTile(lv_obj_t *tile, lv_obj_t *lbl, float mhz)
+{
+    if (!tile || !lbl) return;
+    if (mhz <= 0.0f) {
+        lbl_set(lbl, "--");
+        lv_obj_set_style_bg_color(tile,     lv_color_hex(0x1a1a1a), 0);
+        lv_obj_set_style_border_color(tile, lv_color_hex(0x444444), 0);
+        lv_obj_set_style_text_color(lbl,    lv_color_hex(0x888888), 0);
+        return;
+    }
+    bool inBand;
+    const char *name = freqGetBandName(mhz, inBand);
+    lbl_set(lbl, name);
+    if (inBand) {
+        lv_obj_set_style_bg_color(tile,     lv_color_hex(0x0a2a0a), 0);
+        lv_obj_set_style_border_color(tile, lv_color_hex(0x4caf50), 0);
+        lv_obj_set_style_text_color(lbl,    lv_color_hex(0x4caf50), 0);
+    } else {
+        lv_obj_set_style_bg_color(tile,     lv_color_hex(0x2a0a0a), 0);
+        lv_obj_set_style_border_color(tile, lv_color_hex(0xf44336), 0);
+        lv_obj_set_style_text_color(lbl,    lv_color_hex(0xf44336), 0);
+    }
 }
 
 static void update_power_tab()
@@ -5399,131 +5633,187 @@ static void update_propagation_tab()
         }
     }
 
-    // Band cards
-    for (int i = 0; i < PROP_NUM_BANDS; i++)
+    // Band cards + footer rows 1-2 left: only redraw when new data arrives.
+    // This prevents 12+ simultaneous card redraws (flicker) on every 300ms UI tick.
+    static uint32_t s_propRenderedVersion = 0xFFFFFFFFu;
+    const bool propDataChanged = (s_propDataVersion != s_propRenderedVersion);
+    if (propDataChanged)
+        s_propRenderedVersion = s_propDataVersion;
+
+    // Band cards — colour from PSK Reporter condition; distances from maxTxKm/maxRxKm.
+    // 30m and 60m have no PSK band in the proxy; they fall back to hamqsl HF group conditions.
+    if (propDataChanged) for (int i = 0; i < PROP_NUM_BANDS; i++)
     {
         if (!prop_band_cards[i])
             continue;
 
-        // Pick day or night condition based on current local hour (day = 06:00-19:59)
-        struct tm timeinfo = {};
-        bool isDay = true;
-        if (getLocalTime(&timeinfo, 0))
-            isDay = (timeinfo.tm_hour >= 6 && timeinfo.tm_hour < 20);
-
-        // Cache per-band condition string — styles only update when the condition text changes.
-        static char prevBandCond[PROP_NUM_BANDS][16] = {};
-        static bool prevBandIsDay[PROP_NUM_BANDS] = {};
-
-        // Helper: pick the right condition string and colour for a given group index
-        auto applyHfCond = [&](int g)
+        // Determine condition text:
+        //   1. PSK-derived condition (Good/Fair/Poor/Unknown) when available
+        //   2. VHF special text for 6m (E-Skip) and 2m (Aurora) when no PSK
+        //   3. hamqsl HF group day/night fallback for 30m, 60m
+        const char *cond = "";
+        bool hasPsk = solarData.valid && strlen(solarData.psk[i].condition) > 0;
+        if (hasPsk)
         {
-            const char *cond = isDay ? solarData.hfCondDay[g] : solarData.hfCondNight[g];
-            if (strlen(cond) == 0)
-                return;
-            // Only redraw if condition text or day/night has changed
-            if (strcmp(cond, prevBandCond[i]) == 0 && isDay == prevBandIsDay[i])
+            cond = solarData.psk[i].condition;
+        }
+        else if (solarData.valid)
+        {
+            if (i == 10 && strlen(solarData.vhfESkipEU) > 0)
+                cond = solarData.vhfESkipEU;
+            else if (i == 11 && strlen(solarData.vhfAurora) > 0)
+                cond = solarData.vhfAurora;
+            else
             {
-                lbl_set(prop_band_cond_lbl[i], cond); // text guard handles this cheaply
-                return;
-            }
-            strncpy(prevBandCond[i], cond, sizeof(prevBandCond[i]) - 1);
-            prevBandIsDay[i] = isDay;
-            lbl_set(prop_band_cond_lbl[i], cond);
-            bool good = (strcmp(cond, "Good") == 0);
-            bool fair = (strcmp(cond, "Fair") == 0);
-            lv_color_t cc = good ? lv_color_hex(0x4caf50) : fair ? lv_color_hex(0xff9800)
-                                                                 : lv_color_hex(0xf44336);
-            lv_color_t bg = good ? lv_color_hex(0x1a2e1a) : fair ? lv_color_hex(0x2e2a1a)
-                                                                 : lv_color_hex(0x2e1a1a);
-            lv_obj_set_style_text_color(prop_band_cond_lbl[i], cc, 0);
-            lv_obj_set_style_bg_color(prop_band_cards[i], bg, 0);
-            lv_obj_set_style_border_color(prop_band_cards[i], cc, 0);
-        };
-
-        // HF condition text + card coloring based on condition
-        if (solarData.valid && propBands[i].hfGroupIndex >= 0)
-        {
-            applyHfCond(propBands[i].hfGroupIndex);
-        }
-        // 160m (i=0): use 80m-40m group (index 0)
-        else if (i == 0 && solarData.valid && strlen(solarData.hfCondDay[0]) > 0)
-        {
-            applyHfCond(0);
-        }
-        // 60m (i=2): use 80m-40m group (index 0)
-        else if (i == 2 && solarData.valid && strlen(solarData.hfCondDay[0]) > 0)
-        {
-            applyHfCond(0);
-        }
-        // 6m (i=10): E-Skip
-        else if (i == 10 && solarData.valid && strlen(solarData.vhfESkipEU) > 0)
-        {
-            lbl_set(prop_band_cond_lbl[i], solarData.vhfESkipEU);
-            bool open = (strstr(solarData.vhfESkipEU, "Closed") == nullptr);
-            lv_obj_set_style_text_color(prop_band_cond_lbl[i],
-                                        open ? lv_color_hex(0x4caf50) : lv_color_hex(0x888888), 0);
-            if (open)
-            {
-                lv_obj_set_style_bg_color(prop_band_cards[i], lv_color_hex(0x1a2e1a), 0);
-                lv_obj_set_style_border_color(prop_band_cards[i], lv_color_hex(0x4caf50), 0);
+                struct tm timeinfo = {};
+                bool isDay = true;
+                if (getLocalTime(&timeinfo, 0))
+                    isDay = (timeinfo.tm_hour >= 6 && timeinfo.tm_hour < 20);
+                int g = (propBands[i].hfGroupIndex >= 0) ? propBands[i].hfGroupIndex : 0;
+                cond = isDay ? solarData.hfCondDay[g] : solarData.hfCondNight[g];
             }
         }
-        // 2m (i=11): Aurora
-        else if (i == 11 && solarData.valid && strlen(solarData.vhfAurora) > 0)
+
+        // Map condition text to colours
+        bool isGood = (strcmp(cond, "Good") == 0) ||
+                      (i == 10 && strstr(cond, "Open")   != nullptr) ||
+                      (i == 11 && (strstr(cond, "Active") != nullptr ||
+                                   strstr(cond, "Aurora") != nullptr));
+        bool isFair = (strcmp(cond, "Fair") == 0);
+        bool isPoor = (strcmp(cond, "Poor") == 0);
+
+        lv_color_t cardBg, cardBorder, condColor;
+        if (isGood) {
+            cardBg     = lv_color_hex(0x1a2e1a);
+            cardBorder = lv_color_hex(0x4caf50);
+            condColor  = lv_color_hex(0x4caf50);
+        } else if (isFair) {
+            cardBg     = lv_color_hex(0x2e2a1a);
+            cardBorder = lv_color_hex(0xff9800);
+            condColor  = lv_color_hex(0xff9800);
+        } else if (isPoor) {
+            cardBg     = lv_color_hex(0x2e1a1a);
+            cardBorder = lv_color_hex(0xf44336);
+            condColor  = lv_color_hex(0xf44336);
+        } else {
+            cardBg     = lv_color_hex(0x1a1a2e);
+            cardBorder = lv_color_hex(0x333355);
+            condColor  = lv_color_hex(0x888888);
+        }
+
+        // Only redraw when condition string actually changes
+        static char prevCond[PROP_NUM_BANDS][24] = {};
+        if (strcmp(cond, prevCond[i]) != 0)
         {
-            lbl_set(prop_band_cond_lbl[i], solarData.vhfAurora);
-            bool active = (strstr(solarData.vhfAurora, "Active") != nullptr ||
-                           strstr(solarData.vhfAurora, "Aurora") != nullptr);
-            lv_obj_set_style_text_color(prop_band_cond_lbl[i],
-                                        active ? lv_color_hex(0x4caf50) : lv_color_hex(0x888888), 0);
-            if (active)
+            strncpy(prevCond[i], cond, sizeof(prevCond[i]) - 1);
+            if (prop_band_cond_lbl[i])
             {
-                lv_obj_set_style_bg_color(prop_band_cards[i], lv_color_hex(0x1a2e1a), 0);
-                lv_obj_set_style_border_color(prop_band_cards[i], lv_color_hex(0x4caf50), 0);
+                lbl_set(prop_band_cond_lbl[i], cond);
+                lv_obj_set_style_text_color(prop_band_cond_lbl[i], condColor, 0);
             }
+            lv_obj_set_style_bg_color(prop_band_cards[i], cardBg, 0);
+            lv_obj_set_style_border_color(prop_band_cards[i], cardBorder, 0);
+        }
+
+        // TX / RX mini bars
+        if (prop_band_tx_bar[i] && prop_band_rx_bar[i])
+        {
+            int txVal = 0, rxVal = 0;
+            if (hasPsk)
+            {
+                txVal = (solarData.psk[i].maxTxKm > 0) ? solarData.psk[i].maxTxKm : 0;
+                rxVal = (solarData.psk[i].maxRxKm > 0) ? solarData.psk[i].maxRxKm : 0;
+            }
+            lv_bar_set_value(prop_band_tx_bar[i], txVal, LV_ANIM_OFF);
+            lv_bar_set_value(prop_band_rx_bar[i], rxVal, LV_ANIM_OFF);
+        }
+    }  // end if (propDataChanged) for band cards
+
+    // Footer rows 1 and 2-left also only change when data changes
+    if (!propDataChanged)
+        goto prop_age_only;
+
+    // Footer row 1: space weather — Bz, X-ray class, gray line, sunrise/sunset, GeoMag
+    if (prop_footer_solar_lbl)
+    {
+        if (solarData.valid)
+        {
+            char fsbuf[160];
+            char bzStr[24] = "Bz: --";
+            char xrStr[18] = "";
+            char glStr[28] = "";
+            char ssStr[28] = "";
+            char gmStr[28] = "";
+
+            if (solarData.bzAgeSeconds >= 0)
+                snprintf(bzStr, sizeof(bzStr), "Bz: %+.1f nT", solarData.bz);
+            if (solarData.xrayAgeSeconds >= 0 && strlen(solarData.xrayClass) > 0)
+                snprintf(xrStr, sizeof(xrStr), "  X-ray: %s", solarData.xrayClass);
+            if (solarData.minsToGrayLine != 0)
+            {
+                int m = abs(solarData.minsToGrayLine);
+                if (solarData.minsToGrayLine > 0)
+                    snprintf(glStr, sizeof(glStr), "  GL in %dh%02dm", m / 60, m % 60);
+                else
+                    snprintf(glStr, sizeof(glStr), "  GL -%dh%02dm ago", m / 60, m % 60);
+            }
+            if (strlen(solarData.sunriseUtc) > 0 && strlen(solarData.sunsetUtc) > 0)
+                snprintf(ssStr, sizeof(ssStr), "  Rise: %s  Set: %s",
+                         solarData.sunriseUtc, solarData.sunsetUtc);
+            if (strlen(solarData.geoMag) > 0)
+                snprintf(gmStr, sizeof(gmStr), "  Geo: %s%s",
+                         solarData.geoMag, solarData.recentlyDisturbed ? "!" : "");
+
+            snprintf(fsbuf, sizeof(fsbuf), "%s%s%s%s%s", bzStr, xrStr, glStr, ssStr, gmStr);
+            lbl_set(prop_footer_solar_lbl, fsbuf);
+
+            // Colour by Bz: green (northward), amber (slight south), red (storm threshold)
+            lv_color_t bzColor = (solarData.bzAgeSeconds < 0) ? lv_color_hex(0x888888) :
+                                 (solarData.bz < -10.0f)       ? lv_color_hex(0xf44336) :
+                                 (solarData.bz <   0.0f)       ? lv_color_hex(0xff9800) :
+                                                                  lv_color_hex(0x4caf50);
+            lv_obj_set_style_text_color(prop_footer_solar_lbl, bzColor, 0);
+        }
+        else
+        {
+            lbl_set(prop_footer_solar_lbl, "Waiting for propagation data...");
+            lv_obj_set_style_text_color(prop_footer_solar_lbl, lv_color_hex(0x888888), 0);
         }
     }
 
-    // VHF status
+    // Footer row 2 left: VHF Es / Aurora / S/N
     if (prop_vhf_lbl)
     {
         if (solarData.valid)
         {
-            snprintf(buf, sizeof(buf), "Es: %s  Au: %s  %s  %s",
-                     strlen(solarData.vhfESkipEU) > 0 ? solarData.vhfESkipEU : "--",
-                     strlen(solarData.vhfAurora) > 0 ? solarData.vhfAurora : "--",
-                     solarData.geoMag, solarData.signalNoise);
+            snprintf(buf, sizeof(buf), "Es: %s  |  Aurora: %s  |  S/N: %s",
+                     strlen(solarData.vhfESkipEU)  > 0 ? solarData.vhfESkipEU  : "--",
+                     strlen(solarData.vhfAurora)   > 0 ? solarData.vhfAurora   : "--",
+                     strlen(solarData.signalNoise)  > 0 ? solarData.signalNoise  : "--");
+            lbl_set(prop_vhf_lbl, buf);
         }
         else
-        {
-            // Only set color when transitioning to invalid state
-            static bool prevVhfLblGrey = false;
-            if (!prevVhfLblGrey)
-            {
-                prevVhfLblGrey = true;
-                lv_obj_set_style_text_color(prop_vhf_lbl, lv_color_hex(0x888888), 0);
-            }
-            snprintf(buf, sizeof(buf), "Waiting for propagation data...");
-        }
-        lbl_set(prop_vhf_lbl, buf);
+            lbl_set(prop_vhf_lbl, "");
     }
 
-    // Update time — bucket to 10s to avoid dirty marks every second
+    prop_age_only:
+    // Footer row 2 right: data freshness — always update (ticks every second)
     if (prop_updated_lbl)
     {
         if (solarData.valid)
         {
-            unsigned long age = (millis() - solarData.lastUpdate) / 1000;
-            if (age < 60)
-                snprintf(buf, sizeof(buf), "Updated %lus ago", (age / 10) * 10);
-            else
-                snprintf(buf, sizeof(buf), "Updated %lum ago", age / 60);
+            auto fmtAge = [](int s, char *out, int sz) {
+                if (s < 0)       snprintf(out, sz, "--");
+                else if (s < 60) snprintf(out, sz, "%ds", s);
+                else             snprintf(out, sz, "%dm%02ds", s / 60, s % 60);
+            };
+            char sa[12], pa[12];
+            fmtAge(solarData.ageSeconds,    sa, sizeof(sa));
+            fmtAge(solarData.pskAgeSeconds, pa, sizeof(pa));
+            snprintf(buf, sizeof(buf), "Solar: %s  PSK: %s", sa, pa);
         }
         else
-        {
             snprintf(buf, sizeof(buf), "No data");
-        }
         lbl_set(prop_updated_lbl, buf);
     }
 }
@@ -5882,6 +6172,7 @@ static void update_ui()
         if (strcmp(lv_label_get_text(lbl_vfo_a), vbuf) != 0)
             lbl_set(lbl_vfo_a, vbuf);
     }
+    updateBandTile(band_tile_a, band_lbl_a, antennaTciConnected ? (float)antennaVfoA : 0.0f);
     if (lbl_vfo_b)
     {
         char vbuf[32];
@@ -5892,6 +6183,7 @@ static void update_ui()
         if (strcmp(lv_label_get_text(lbl_vfo_b), vbuf) != 0)
             lbl_set(lbl_vfo_b, vbuf);
     }
+    updateBandTile(band_tile_b, band_lbl_b, antennaTciConnected ? (float)antennaVfoB : 0.0f);
 
     if (antennaDataReady && (millis() - antennaLastUpdate < 30000))
     {
