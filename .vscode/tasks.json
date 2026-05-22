@@ -1,71 +1,235 @@
 {
-  "version": "2.0.0",
-  "tasks": [
-    {
-      "label": "PIO Build (touchpanel-serial)",
-      "type": "shell",
-      "command": "pio",
-      "args": [
-        "run",
-        "-e",
-        "touchpanel-serial"
-      ],
-      "group": {
-        "kind": "build",
-        "isDefault": true
-      },
-      "problemMatcher": []
-    },
-    {
-      "label": "PIO Build (touchpanel-ota)",
-      "type": "shell",
-      "command": "pio",
-      "args": [
-        "run",
-        "-e",
-        "touchpanel-ota"
-      ],
-      "problemMatcher": []
-    },
-    {
-      "label": "PIO Upload (touchpanel-serial)",
-      "type": "shell",
-      "command": "pio",
-      "args": [
-        "run",
-        "-e",
-        "touchpanel-serial",
-        "-t",
-        "upload"
-      ],
-      "problemMatcher": []
-    },
-    {
-      "label": "PIO Upload (touchpanel-serial-manual)",
-      "type": "shell",
-      "command": "pio",
-      "args": [
-        "run",
-        "-e",
-        "touchpanel-serial-manual",
-        "-t",
-        "upload"
-      ],
-      "problemMatcher": []
-    },
-    {
-      "label": "PIO Probe Bootloader (COM6)",
-      "type": "shell",
-      "command": "C:/Users/lance/.platformio/penv/Scripts/python.exe",
-      "args": [
-        "C:/Users/lance/.platformio/packages/tool-esptoolpy/esptool.py",
-        "--port",
-        "COM6",
-        "--chip",
-        "esp32s3",
-        "chip_id"
-      ],
-      "problemMatcher": []
-    }
-  ]
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "PIO Build (touchpanel-serial)",
+			"type": "shell",
+			"command": "C:\\BuildCache\\platformio\\penv\\Scripts\\pio.exe",
+			"args": [
+				"run",
+				"-e",
+				"touchpanel-serial"
+			],
+			"options": {
+				"shell": {
+					"executable": "cmd.exe",
+					"args": [
+						"/d",
+						"/c"
+					]
+				}
+			},
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			},
+			"problemMatcher": []
+		},
+		{
+			"label": "PIO Build (touchpanel-ota)",
+			"type": "shell",
+			"command": "C:\\BuildCache\\platformio\\penv\\Scripts\\pio.exe",
+			"args": [
+				"run",
+				"-e",
+				"touchpanel-ota"
+			],
+			"options": {
+				"shell": {
+					"executable": "cmd.exe",
+					"args": [
+						"/d",
+						"/c"
+					]
+				}
+			},
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"label": "PIO Upload (touchpanel-serial)",
+			"type": "shell",
+			"command": "C:\\BuildCache\\platformio\\penv\\Scripts\\pio.exe",
+			"args": [
+				"run",
+				"-e",
+				"touchpanel-serial",
+				"-t",
+				"upload"
+			],
+			"options": {
+				"shell": {
+					"executable": "cmd.exe",
+					"args": [
+						"/d",
+						"/c"
+					]
+				}
+			},
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"label": "PIO Upload (touchpanel-serial-manual)",
+			"type": "shell",
+			"command": "C:\\BuildCache\\platformio\\penv\\Scripts\\pio.exe",
+			"args": [
+				"run",
+				"-e",
+				"touchpanel-serial-manual",
+				"-t",
+				"upload"
+			],
+			"options": {
+				"shell": {
+					"executable": "cmd.exe",
+					"args": [
+						"/d",
+						"/c"
+					]
+				}
+			},
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"label": "PIO Upload (touchpanel-ota)",
+			"type": "shell",
+			"command": "C:\\BuildCache\\platformio\\penv\\Scripts\\pio.exe",
+			"args": [
+				"run",
+				"-e",
+				"touchpanel-ota",
+				"-t",
+				"upload"
+			],
+			"options": {
+				"shell": {
+					"executable": "cmd.exe",
+					"args": [
+						"/d",
+						"/c"
+					]
+				}
+			},
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"label": "PIO Probe Bootloader (COM6)",
+			"type": "shell",
+			"command": "C:\\Python\\313\\python.exe",
+			"args": [
+				"-m",
+				"esptool",
+				"--port",
+				"COM6",
+				"--chip",
+				"esp32s3",
+				"chip_id"
+			],
+			"options": {
+				"shell": {
+					"executable": "cmd.exe",
+					"args": [
+						"/d",
+						"/c"
+					]
+				}
+			},
+			"problemMatcher": []
+		},
+		{
+			"label": "Deploy via Pi (OTA)",
+			"type": "shell",
+			"command": "powershell.exe",
+			"args": [
+				"-ExecutionPolicy",
+				"Bypass",
+				"-File",
+				"${workspaceFolder}/deploy_via_pi.ps1"
+			],
+			"options": {
+				"shell": {
+					"executable": "cmd.exe",
+					"args": [
+						"/d",
+						"/c"
+					]
+				}
+			},
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"label": "Deploy via Pi (OTA, skip build)",
+			"type": "shell",
+			"command": "powershell.exe",
+			"args": [
+				"-ExecutionPolicy",
+				"Bypass",
+				"-File",
+				"${workspaceFolder}/deploy_via_pi.ps1",
+				"-SkipBuild"
+			],
+			"options": {
+				"shell": {
+					"executable": "cmd.exe",
+					"args": [
+						"/d",
+						"/c"
+					]
+				}
+			},
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"label": "Deploy via Pi (OTA)",
+			"type": "shell",
+			"command": "powershell.exe -ExecutionPolicy Bypass -File deploy_via_pi.ps1",
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "PIO Upload Safe",
+			"type": "shell",
+			"command": "C:\\BuildCache\\platformio\\penv\\Scripts\\pio.exe run -e touchpanel-serial -t upload",
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "PIO Upload - Internal Buffers",
+			"type": "shell",
+			"command": "C:\\BuildCache\\platformio\\penv\\Scripts\\pio.exe run -e touchpanel-serial -t upload",
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Clean and Upload TouchController",
+			"type": "shell",
+			"command": "C:\\BuildCache\\platformio\\penv\\Scripts\\pio.exe",
+			"args": [
+				"run",
+				"-e",
+				"touchpanel-serial",
+				"-t",
+				"clean",
+				"-t",
+				"upload"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Restore main.cpp from UfiE.cpp history",
+			"type": "shell",
+			"command": "Copy-Item -Path 'C:\\Users\\lance\\AppData\\Roaming\\Code\\User\\History\\-5b675a75\\UfiE.cpp' -Destination 'C:\\Users\\lance\\OneDrive\\Dev\\PIO\\TouchController\\src\\main.cpp' -Force; Write-Host 'Restored main.cpp from UfiE.cpp (May 8 2026 - last known good version)'"
+		},
+		{
+			"label": "Git Commit and Push",
+			"type": "shell",
+			"command": "cd 'C:\\Users\\lance\\OneDrive\\Dev\\PIO\\TouchController'; git add -A; git commit -m 'Restore full-featured main.cpp (remote RSSI, peer uptime/build date, rotator memories, power confirmation)'; git push; Write-Host 'Done.' -ForegroundColor Green"
+		}
+	]
 }

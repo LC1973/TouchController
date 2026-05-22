@@ -4,7 +4,7 @@
     "ssid": "greenrun",
     "password": "connecticut"
   },
-  "syslog": "192.168.3.11",
+  "syslog": "192.168.16.11",
   "relayLabels": [
     "Relay 1",
     "Relay 2",
@@ -15,5 +15,10 @@
   ],
   "swarm": {
     "enabled": true
+  },
+  "tci": {
+    "enabled": true,
+    "host": "192.168.1.44",
+    "port": 40001
   }
 }

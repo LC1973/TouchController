@@ -12,32 +12,35 @@
             "type": "platformio-debug",
             "request": "launch",
             "name": "PIO Debug",
-            "executable": "C:/Users/lance/PlatformIO/TouchController/.pio/build/touchpanel-serial/firmware.elf",
-            "projectEnvName": "touchpanel-serial",
-            "toolchainBinDir": "C:/Users/lance/.platformio/packages/toolchain-xtensa-esp32s3/bin",
+            "executable": "C:/BuildCache/pio/TouchController/build/touchpanel-ota/firmware.elf",
+            "projectEnvName": "touchpanel-ota",
+            "toolchainBinDir": "C:/BuildCache/platformio/packages/toolchain-xtensa-esp-elf/bin",
             "internalConsoleOptions": "openOnSessionStart",
+            "svdPath": "C:/BuildCache/platformio/platforms/espressif32@src-596c9938872833461cb0fe93e12b1b9f/misc/svd/esp32s3.svd",
             "preLaunchTask": {
                 "type": "PlatformIO",
-                "task": "Pre-Debug (touchpanel-serial)"
+                "task": "Pre-Debug (touchpanel-ota)"
             }
         },
         {
             "type": "platformio-debug",
             "request": "launch",
             "name": "PIO Debug (skip Pre-Debug)",
-            "executable": "C:/Users/lance/PlatformIO/TouchController/.pio/build/touchpanel-serial/firmware.elf",
-            "projectEnvName": "touchpanel-serial",
-            "toolchainBinDir": "C:/Users/lance/.platformio/packages/toolchain-xtensa-esp32s3/bin",
-            "internalConsoleOptions": "openOnSessionStart"
+            "executable": "C:/BuildCache/pio/TouchController/build/touchpanel-ota/firmware.elf",
+            "projectEnvName": "touchpanel-ota",
+            "toolchainBinDir": "C:/BuildCache/platformio/packages/toolchain-xtensa-esp-elf/bin",
+            "internalConsoleOptions": "openOnSessionStart",
+            "svdPath": "C:/BuildCache/platformio/platforms/espressif32@src-596c9938872833461cb0fe93e12b1b9f/misc/svd/esp32s3.svd"
         },
         {
             "type": "platformio-debug",
             "request": "launch",
             "name": "PIO Debug (without uploading)",
-            "executable": "C:/Users/lance/PlatformIO/TouchController/.pio/build/touchpanel-serial/firmware.elf",
-            "projectEnvName": "touchpanel-serial",
-            "toolchainBinDir": "C:/Users/lance/.platformio/packages/toolchain-xtensa-esp32s3/bin",
+            "executable": "C:/BuildCache/pio/TouchController/build/touchpanel-ota/firmware.elf",
+            "projectEnvName": "touchpanel-ota",
+            "toolchainBinDir": "C:/BuildCache/platformio/packages/toolchain-xtensa-esp-elf/bin",
             "internalConsoleOptions": "openOnSessionStart",
+            "svdPath": "C:/BuildCache/platformio/platforms/espressif32@src-596c9938872833461cb0fe93e12b1b9f/misc/svd/esp32s3.svd",
             "loadMode": "manual"
         }
     ]
