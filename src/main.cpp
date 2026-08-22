@@ -301,38 +301,45 @@ static void blinkBacklightProbe(uint8_t cycles = 6, uint16_t intervalMs = 250)
 }
 
 // ============================================================
-// Display Driver (ESP-IDF RGB panel with bounce buffer)
+// Display Driver (ESP-IDF RGB panel, single buffer + bounce buffer)
 //
 // LovyanGFX Bus_RGB is incompatible with ESP32-S3 OPI PSRAM: it bypasses
-// esp_lcd_new_rgb_panel() and uses direct GDMA without a bounce buffer,
-// causing DMA reads of stale PSRAM data due to cache coherency issues on
-// chip rev v0.2 (ESP_ROM_HAS_CACHE_WRITEBACK_BUG).
+// esp_lcd_new_rgb_panel() and uses direct GDMA without going through the
+// documented driver, causing DMA reads of stale PSRAM data due to cache
+// coherency issues on chip rev v0.2 (ESP_ROM_HAS_CACHE_WRITEBACK_BUG).
 //
-// The official Waveshare fix uses esp_lcd_new_rgb_panel() with
-// bounce_buffer_size_px: the ESP-IDF RGB driver ISR copies PSRAM→internal
-// SRAM bounce buffer before each DMA transfer, bypassing the cache issue.
+// 2026-08-23 ("Attempt E"): reverted to the architecture from this project's
+// very first commit (477709e), after a whole session (2026-08-22, Attempts
+// A-D) of tuning num_fbs / bounce_buffer_size_px / pclk on top of a
+// completely different "zero-copy direct_mode" architecture failed to
+// reproduce a display the user remembered as having worked. Git history
+// traced the zero-copy architecture — LVGL rendering directly into the
+// panel's own PSRAM frame buffer(s) via esp_lcd_rgb_panel_get_frame_buffer(),
+// disp_drv.direct_mode=1, and a hand-rolled vsync-semaphore blocking scheme
+// in flush_cb — to commit b492e07 ("Restore full-featured main.cpp"), which
+// also quietly changed pclk from 30MHz to 14MHz and rewrote the porches, none
+// of which is mentioned in that commit's message (focused on application
+// features). That whole architecture is the common ancestor of every symptom
+// chased this session (roll, shift, flicker, glitching) across every
+// buffer/pclk combination tried.
+//
+// This reverts to the simple, standard LVGL integration pattern instead:
+// LVGL owns small SEPARATE partial-render buffers in PSRAM (not the panel's
+// own frame buffer), flush_cb hands each rendered strip to
+// esp_lcd_panel_draw_bitmap() with no manual vsync blocking, and the
+// ESP-IDF driver's own num_fbs=1 + bounce_buffer_size_px combination — one of
+// Espressif's two officially documented (and NOT mutually exclusive at
+// num_fbs=1) anti-tearing schemes — handles all PSRAM/DMA synchronization
+// internally. No direct_mode dual-buffer sync, no foreign-buffer driver
+// internals to reason about, no custom ISR. See RGB_PANEL_NOTES.md, "Attempt
+// E: revert to the original architecture" for the full trace before changing
+// this again.
 // ============================================================
 
 static esp_lcd_panel_handle_t s_panel_handle = NULL;
-static SemaphoreHandle_t s_vsync_sem = NULL;
 
-// Set inside lvgl_flush_cb() when the last tile of a frame has been passed to
-// draw_bitmap; cleared in loop() after the vsync ISR confirms the DMA swap.
-// Must be declared before vsync_isr_cb which reads it from ISR context.
-static volatile lv_disp_drv_t *s_pending_flush_drv = NULL;
-
-// Called from the RGB panel VSYNC ISR at every ~33 Hz tick.
-// Unconditional give: lvgl_flush_cb drains stale tokens before waiting,
-// so the flush_cb always wakes on the vsync that performs the actual
-// DMA buffer-pointer swap.  (Pattern from Espressif esp_lvgl_port.)
-static bool IRAM_ATTR vsync_isr_cb(esp_lcd_panel_handle_t /*panel*/,
-                                   const esp_lcd_rgb_panel_event_data_t * /*edata*/,
-                                   void *user_ctx)
-{
-    BaseType_t high_task_woken = pdFALSE;
-    xSemaphoreGiveFromISR((SemaphoreHandle_t)user_ctx, &high_task_woken);
-    return high_task_woken == pdTRUE;
-}
+// Height, in rows, of each LVGL partial-render strip buffer (see buf1/buf2 below).
+#define LVGL_BUF_LINES 48
 
 // Detected GT911 I2C address (0x5D or 0x14, depends on INT state at reset).
 static uint8_t gGt911Addr = 0x5D;
@@ -495,11 +502,10 @@ static void initRgbPanel()
     panel_config.timings.flags.pclk_active_neg = LCD_PCLK_ACTIVE_NEG;
     panel_config.data_width = 16;
     panel_config.bits_per_pixel = 16;
-    panel_config.num_fbs = 1; // Single buffer: eliminates double-buffer swap timing that caused "content shift" artifact
-    // Bounce buffer in internal SRAM: 20 rows × 1024 pixels.
-    // Larger bounce buffer halves the ISR call rate (~1800/s vs ~3600/s at 60 Hz),
-    // reducing PSRAM read contention from the bounce-buffer copy ISR.
-    panel_config.bounce_buffer_size_px = LCD_WIDTH * 20;
+    panel_config.num_fbs = 1;
+    // Bounce buffer in internal SRAM: 10 rows x 1024 pixels.
+    // The ESP-IDF ISR copies PSRAM framebuffer -> bounce buffer each VSYNC.
+    panel_config.bounce_buffer_size_px = LCD_WIDTH * 10;
     panel_config.sram_trans_align = 4;
     panel_config.psram_trans_align = 64;
     panel_config.hsync_gpio_num = LCD_HSYNC;
@@ -530,12 +536,6 @@ static void initRgbPanel()
     ESP_ERROR_CHECK(esp_lcd_panel_reset(s_panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel_handle));
 
-    // Register VSYNC callback so lvgl_flush_cb can synchronise to the display.
-    s_vsync_sem = xSemaphoreCreateBinary();
-    esp_lcd_rgb_panel_event_callbacks_t rgb_cbs = {};
-    rgb_cbs.on_vsync = vsync_isr_cb;
-    esp_lcd_rgb_panel_register_event_callbacks(s_panel_handle, &rgb_cbs, s_vsync_sem);
-
     Serial.printf("[LCD] esp_lcd RGB panel OK  handle=%p\n", (void *)s_panel_handle);
 }
 
@@ -543,16 +543,14 @@ static void initRgbPanel()
 // Globals
 // ============================================================
 
-// LVGL draw buffers — pointers are set to the two PSRAM frame buffers from
-// esp_lcd_rgb_panel_get_frame_buffer() after initRgbPanel().
+// LVGL draw buffers: small partial-render strips in PSRAM, separate from the
+// panel's own frame buffer. Allocated in setup() (LCD_WIDTH * LVGL_BUF_LINES
+// each). lvgl_flush_cb() hands each rendered strip to esp_lcd_panel_draw_bitmap(),
+// which copies it into the panel's single internal frame buffer via the
+// bounce-buffer pipeline — no direct access to the hardware frame buffer here.
 static lv_disp_draw_buf_t draw_buf;
 static lv_color_t *buf1 = nullptr;
 static lv_color_t *buf2 = nullptr;
-
-// Set inside lvgl_flush_cb() when the last strip of a frame has been sent to
-// the RGB driver; cleared when the vsync callback confirms the DMA has switched
-// to the new frame buffer.  (Declared before vsync_isr_cb above.)
-// No longer used — flush_cb now blocks internally using s_vsync_sem directly.
 
 static lv_disp_drv_t disp_drv;
 static lv_indev_drv_t indev_drv;
@@ -716,10 +714,10 @@ static lv_obj_t *canvas_map = nullptr;
 // Two pixel buffers for the map:
 //   map_base_buf — clean pixels (coastlines + city labels as pixels, no bearing lines)
 //   map_buf      — what LVGL displays (base + bearing lines on top)
-// Direct framebuffer writes go to buf1 AND buf2 simultaneously, bypassing LVGL
-// dirty-region tracking entirely — zero double-buffer flicker.
-static int map_fb_x = 0;  // screen x of canvas_map top-left (resolved after first lv_timer_handler)
-static int map_fb_y = 0;  // screen y of canvas_map top-left
+// updateBearingLinesDirect() writes bearing-line pixels straight into map_buf
+// (MAP_SIZE-strided, MAP-relative coordinates) and calls lv_obj_invalidate() to
+// have LVGL redraw canvas_map through the normal render pipeline — no absolute
+// screen-coordinate tracking needed (see fbFillRect/fbDrawText/updateBearingLinesDirect).
 static lv_obj_t *btn_manual_ccw = nullptr;
 static lv_obj_t *btn_manual_cw = nullptr;
 static lv_obj_t *btn_manual_stop = nullptr;
@@ -1765,22 +1763,10 @@ static void pollLinkMonitor()
 
 static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_p)
 {
-    // Single-buffer mode (num_fbs=1): DMA always reads buf1 via the bounce-buffer
-    // pipeline — there is no DMA pointer swap.  We still call draw_bitmap() on the
-    // last flush because the ESP-IDF RGB driver uses it to trigger a cache-writeback
-    // of the PSRAM region so the bounce-buffer ISR sees fresh pixels.
-    // The vsync wait paces rendering to the display refresh rate (~30 Hz) and
-    // prevents thrashing PSRAM with back-to-back full-frame writes.
-    if (lv_disp_flush_is_last(drv))
-    {
-        esp_lcd_panel_draw_bitmap(s_panel_handle,
-                                  area->x1, area->y1,
-                                  area->x2 + 1, area->y2 + 1,
-                                  color_p);
-        // Pace to display refresh: drain any accumulated vsync token, wait for next.
-        xSemaphoreTake(s_vsync_sem, 0);             // drain stale token
-        xSemaphoreTake(s_vsync_sem, portMAX_DELAY); // wait for next vsync
-    }
+    esp_lcd_panel_draw_bitmap(s_panel_handle,
+                              area->x1, area->y1,
+                              area->x2 + 1, area->y2 + 1,
+                              color_p);
     lv_disp_flush_ready(drv);
 }
 
@@ -3709,9 +3695,10 @@ static void drawAzimuthalMap()
         memcpy(map_base_buf, map_buf, MAP_SIZE * MAP_SIZE * sizeof(lv_color_t));
     } // end base render
 
-    // Register pixel buffer with LVGL once per zoom change.
-    // After this, LVGL renders map_buf into both framebuffers over 2 vsync cycles.
-    // From that point on, bearing updates bypass LVGL entirely (direct FB writes).
+    // Register pixel buffer with LVGL once per zoom change. lv_img_set_src()
+    // invalidates canvas_map itself; updateBearingLinesDirect() (called right
+    // after this by the caller) overwrites map_buf again and invalidates once
+    // more, so no manual lv_timer_handler() nudge is needed here.
     if (canvas_map)
     {
         map_img_dsc.header.always_zero = 0;
@@ -3721,27 +3708,26 @@ static void drawAzimuthalMap()
         map_img_dsc.data_size = MAP_SIZE * MAP_SIZE * sizeof(lv_color_t);
         map_img_dsc.data      = (const uint8_t *)map_buf;
         lv_img_set_src(canvas_map, &map_img_dsc);
-        // Give LVGL one timer tick to propagate the new image into the hardware
-        // framebuffer before we start writing bearing lines directly into it.
-        lv_timer_handler();
     }
 }
 
-// Fill a rectangle directly into a hardware framebuffer (absolute screen coords).
+// Fill a rectangle directly into map_buf (MAP_SIZE-relative coords). Only ever
+// used on map_buf, which LVGL redraws normally via lv_obj_invalidate() — see
+// updateBearingLinesDirect().
 static void fbFillRect(lv_color_t *fb, int x, int y, int w, int h, lv_color_t col)
 {
     for (int r = y; r < y + h; r++)
     {
-        if (r < 0 || r >= LCD_HEIGHT) continue;
+        if (r < 0 || r >= MAP_SIZE) continue;
         for (int c = x; c < x + w; c++)
         {
-            if (c < 0 || c >= LCD_WIDTH) continue;
-            fb[r * LCD_WIDTH + c] = col;
+            if (c < 0 || c >= MAP_SIZE) continue;
+            fb[r * MAP_SIZE + c] = col;
         }
     }
 }
 
-// Render ASCII text into a hardware framebuffer using lv_font_montserrat_12.
+// Render ASCII text into map_buf (MAP_SIZE-relative coords) using lv_font_montserrat_12.
 // (x, y) is the top-left of the first character's bounding box (NOT the baseline).
 static void fbDrawText(lv_color_t *fb, int x, int y, const char *text, lv_color_t color,
                        const lv_font_t *font = &lv_font_montserrat_16)
@@ -3787,8 +3773,8 @@ static void fbDrawText(lv_color_t *fb, int x, int y, const char *text, lv_color_
                 {
                     int px = cx + (int)g.ofs_x + col;
                     int py = glyph_top + row;
-                    if (px >= 0 && px < LCD_WIDTH && py >= 0 && py < LCD_HEIGHT)
-                        fb[py * LCD_WIDTH + px] = color;
+                    if (px >= 0 && px < MAP_SIZE && py >= 0 && py < MAP_SIZE)
+                        fb[py * MAP_SIZE + px] = color;
                 }
                 // Advance bit pointer through flat bitstream
                 if (col_bit < col_bit_max) {
@@ -3805,177 +3791,154 @@ static void fbDrawText(lv_color_t *fb, int x, int y, const char *text, lv_color_
     }
 }
 
-// Update bearing + target lines by writing pixels directly into BOTH hardware
-// framebuffers simultaneously.  Both buffers always have identical content in the
-// bearing-line region — the double-buffer partial-update mismatch is impossible.
-// map_base_buf contains clean pixels (coastlines + city label text + city dots),
-// so restoring from it correctly preserves city names.
+// Update bearing + target lines by writing pixels directly into map_buf
+// (MAP_SIZE-relative coordinates), then invalidating canvas_map so LVGL redraws
+// it through the normal render pipeline. map_base_buf contains clean pixels
+// (coastlines + city label text + city dots), so restoring from it correctly
+// preserves city names.
 static void updateBearingLinesDirect()
 {
-    if (!buf1 || !buf2 || !map_buf || !map_base_buf)
+    if (!map_buf || !map_base_buf || !canvas_map)
         return;
-    // Lazily resolve canvas_map screen position (layout resolves after first
-    // lv_timer_handler tick, which is called in drawAzimuthalMap before we get here)
-    if (map_fb_x == 0 && map_fb_y == 0 && canvas_map)
-    {
-        lv_area_t ca;
-        lv_obj_get_coords(canvas_map, &ca);
-        if (ca.x1 > 0 || ca.y1 > 0)
-        {
-            map_fb_x = ca.x1;
-            map_fb_y = ca.y1;
-            debugLog(("[MAP] fb coords (" + String(map_fb_x) + "," + String(map_fb_y) + ")").c_str());
-        }
-        else return; // not ready yet
-    }
 
     bool rotOnline = (rotatorBearing >= 0) && (millis() - rotatorLastUpdate < 60000);
 
-    // Single framebuffer — write directly to buf1 only.
+    lv_color_t *fb = map_buf;
+
+    // Restore clean map from base (erases old bearing line, keeps labels)
+    memcpy(fb, map_base_buf, MAP_SIZE * MAP_SIZE * sizeof(lv_color_t));
+
+    // Draw green bearing line (3px wide Bresenham)
+    if (rotOnline)
     {
-        lv_color_t *fb = buf1;
+        float rad = rotatorBearing * (float)DEG_TO_RAD;
+        int ex = MAP_CX + (int)(MAP_R * sinf(rad));
+        int ey = MAP_CY - (int)(MAP_R * cosf(rad));
+        auto fbPix = [&](int px, int py, lv_color_t col) {
+            if (px >= 0 && px < MAP_SIZE && py >= 0 && py < MAP_SIZE)
+                fb[py * MAP_SIZE + px] = col;
+        };
+        lv_color_t green = lv_color_hex(0x4caf50);
+        int x0 = MAP_CX, y0 = MAP_CY, x1 = ex, y1 = ey;
+        int dx = abs(x1-x0), sx2 = x0<x1?1:-1;
+        int dy = -abs(y1-y0), sy2 = y0<y1?1:-1;
+        int err = dx+dy;
+        for (;;) {
+            fbPix(x0,   y0,   green);
+            fbPix(x0+1, y0,   green);
+            fbPix(x0,   y0+1, green);
+            if (x0==x1 && y0==y1) break;
+            int e2 = 2*err;
+            if (e2 >= dy) { err += dy; x0 += sx2; }
+            if (e2 <= dx) { err += dx; y0 += sy2; }
+        }
+    }
 
-        // Restore clean map rows from base (erases old bearing line, keeps labels)
-        for (int row = 0; row < MAP_SIZE; row++)
+    // Draw orange dashed target line
+    if (rotOnline && rotatorMoving && rotatorTargetBearing >= 0)
+    {
+        float rad = rotatorTargetBearing * (float)DEG_TO_RAD;
+        lv_color_t orange = lv_color_hex(0xff9800);
+        for (int r = 0; r < MAP_R; r += 2)
         {
-            int fb_row = map_fb_y + row;
-            if (fb_row < 0 || fb_row >= LCD_HEIGHT) continue;
-            memcpy(&fb[fb_row * LCD_WIDTH + map_fb_x],
-                   &map_base_buf[row * MAP_SIZE],
-                   MAP_SIZE * sizeof(lv_color_t));
+            int px = MAP_CX + (int)(r * sinf(rad));
+            int py = MAP_CY - (int)(r * cosf(rad));
+            if (px >= 0 && px < MAP_SIZE && py >= 0 && py < MAP_SIZE)
+                fb[py * MAP_SIZE + px] = orange;
+        }
+    }
+
+    // Status badge at top-left of map.
+    // Background colour reflects state; "Rotating..." flashes at ~600ms period.
+    {
+        const char *statusText;
+        lv_color_t bgCol;
+        bool flash = rotOnline && rotatorEnabled && rotatorMoving;
+
+        // Detect command failure: non-2xx HTTP response, or rotator still idle
+        // 5 seconds after a goto/manual command was sent.
+        bool cmdPending    = (rotatorCommandSentAt > 0);
+        bool cmdErrorCode  = cmdPending && (g_rotatorCmdHttpCode != 0)
+                                && (g_rotatorCmdHttpCode < 200 || g_rotatorCmdHttpCode >= 300);
+        bool cmdTimeout    = cmdPending && !rotatorMoving
+                                && (millis() - rotatorCommandSentAt > 5000)
+                                && g_rotatorCmdHttpCode != 0; // result arrived but no motion
+        static char errBuf[20];
+
+        if (!rotOnline)
+        {
+            statusText = "Waiting..."; bgCol = lv_color_hex(0x7B1414);
+        }
+        else if (cmdErrorCode)
+        {
+            snprintf(errBuf, sizeof(errBuf), "Error %d", (int)g_rotatorCmdHttpCode);
+            statusText = errBuf; bgCol = lv_color_hex(0xB71C1C);
+        }
+        else if (cmdTimeout)
+        {
+            statusText = "No response"; bgCol = lv_color_hex(0xB71C1C);
+        }
+        else if (!rotatorEnabled)
+        {
+            statusText = "Disabled";   bgCol = lv_color_hex(0x2a2a2a);
+        }
+        else if (rotatorMoving)
+        {
+            statusText = "Rotating..."; bgCol = lv_color_hex(0x1565C0);
+        }
+        else if (!rotatorCalibrated)
+        {
+            statusText = "No calibration"; bgCol = lv_color_hex(0x7B4F00);
+        }
+        else
+        {
+            statusText = "Ready"; bgCol = lv_color_hex(0x1B5E20);
         }
 
-        // Draw green bearing line (3px wide Bresenham)
-        if (rotOnline)
+        // Badge: 4px from top-left corner of map, 28px tall (montserrat_16 line_height~20)
+        int bx = 4;
+        int by = 4;
+        int bw = 148;
+        int bh = 28;
+        fbFillRect(fb, bx, by, bw, bh, bgCol);
+
+        // Swoosh: when rotating, draw a bright stripe sweeping left→right over 1.2s
+        if (rotatorMoving && rotOnline && rotatorEnabled)
         {
-            float rad = rotatorBearing * (float)DEG_TO_RAD;
-            int ex = MAP_CX + (int)(MAP_R * sinf(rad));
-            int ey = MAP_CY - (int)(MAP_R * cosf(rad));
-            auto fbPix = [&](int px, int py, lv_color_t col) {
-                int sx = map_fb_x + px, sy = map_fb_y + py;
-                if (sx >= 0 && sx < LCD_WIDTH && sy >= 0 && sy < LCD_HEIGHT)
-                    fb[sy * LCD_WIDTH + sx] = col;
-            };
-            lv_color_t green = lv_color_hex(0x4caf50);
-            int x0 = MAP_CX, y0 = MAP_CY, x1 = ex, y1 = ey;
-            int dx = abs(x1-x0), sx2 = x0<x1?1:-1;
-            int dy = -abs(y1-y0), sy2 = y0<y1?1:-1;
-            int err = dx+dy;
-            for (;;) {
-                fbPix(x0,   y0,   green);
-                fbPix(x0+1, y0,   green);
-                fbPix(x0,   y0+1, green);
-                if (x0==x1 && y0==y1) break;
-                int e2 = 2*err;
-                if (e2 >= dy) { err += dy; x0 += sx2; }
-                if (e2 <= dx) { err += dx; y0 += sy2; }
-            }
-        }
-
-        // Draw orange dashed target line
-        if (rotOnline && rotatorMoving && rotatorTargetBearing >= 0)
-        {
-            float rad = rotatorTargetBearing * (float)DEG_TO_RAD;
-            lv_color_t orange = lv_color_hex(0xff9800);
-            for (int r = 0; r < MAP_R; r += 2)
+            uint32_t sweep_ms   = millis() % 1200u;
+            // stripe centre travels across badge interior (skip 1-px rim each side)
+            int inner_w         = bw - 2;
+            int stripe_cx       = bx + 1 + (int)((uint32_t)sweep_ms * (uint32_t)inner_w / 1200u);
+            const int STRIPE_HW = 10; // half-width in pixels
+            for (int sy = by + 1; sy < by + bh - 1; sy++)
             {
-                int px = MAP_CX + (int)(r * sinf(rad));
-                int py = MAP_CY - (int)(r * cosf(rad));
-                int sx = map_fb_x + px, sy = map_fb_y + py;
-                if (sx >= 0 && sx < LCD_WIDTH && sy >= 0 && sy < LCD_HEIGHT)
-                    fb[sy * LCD_WIDTH + sx] = orange;
-            }
-        }
-
-        // Status badge at top-left of map.
-        // Background colour reflects state; "Rotating..." flashes at ~600ms period.
-        {
-            const char *statusText;
-            lv_color_t bgCol;
-            bool flash = rotOnline && rotatorEnabled && rotatorMoving;
-
-            // Detect command failure: non-2xx HTTP response, or rotator still idle
-            // 5 seconds after a goto/manual command was sent.
-            bool cmdPending    = (rotatorCommandSentAt > 0);
-            bool cmdErrorCode  = cmdPending && (g_rotatorCmdHttpCode != 0)
-                                    && (g_rotatorCmdHttpCode < 200 || g_rotatorCmdHttpCode >= 300);
-            bool cmdTimeout    = cmdPending && !rotatorMoving
-                                    && (millis() - rotatorCommandSentAt > 5000)
-                                    && g_rotatorCmdHttpCode != 0; // result arrived but no motion
-            static char errBuf[20];
-
-            if (!rotOnline)
-            {
-                statusText = "Waiting..."; bgCol = lv_color_hex(0x7B1414);
-            }
-            else if (cmdErrorCode)
-            {
-                snprintf(errBuf, sizeof(errBuf), "Error %d", (int)g_rotatorCmdHttpCode);
-                statusText = errBuf; bgCol = lv_color_hex(0xB71C1C);
-            }
-            else if (cmdTimeout)
-            {
-                statusText = "No response"; bgCol = lv_color_hex(0xB71C1C);
-            }
-            else if (!rotatorEnabled)
-            {
-                statusText = "Disabled";   bgCol = lv_color_hex(0x2a2a2a);
-            }
-            else if (rotatorMoving)
-            {
-                statusText = "Rotating..."; bgCol = lv_color_hex(0x1565C0);
-            }
-            else if (!rotatorCalibrated)
-            {
-                statusText = "No calibration"; bgCol = lv_color_hex(0x7B4F00);
-            }
-            else
-            {
-                statusText = "Ready"; bgCol = lv_color_hex(0x1B5E20);
-            }
-
-            // Badge: 4px from top-left corner of map, 28px tall (montserrat_16 line_height~20)
-            int bx = map_fb_x + 4;
-            int by = map_fb_y + 4;
-            int bw = 148;
-            int bh = 28;
-            fbFillRect(fb, bx, by, bw, bh, bgCol);
-
-            // Swoosh: when rotating, draw a bright stripe sweeping left→right over 1.2s
-            if (rotatorMoving && rotOnline && rotatorEnabled)
-            {
-                uint32_t sweep_ms   = millis() % 1200u;
-                // stripe centre travels across badge interior (skip 1-px rim each side)
-                int inner_w         = bw - 2;
-                int stripe_cx       = bx + 1 + (int)((uint32_t)sweep_ms * (uint32_t)inner_w / 1200u);
-                const int STRIPE_HW = 10; // half-width in pixels
-                for (int sy = by + 1; sy < by + bh - 1; sy++)
+                for (int dx2 = -STRIPE_HW; dx2 <= STRIPE_HW; dx2++)
                 {
-                    for (int dx2 = -STRIPE_HW; dx2 <= STRIPE_HW; dx2++)
-                    {
-                        int sx = stripe_cx + dx2;
-                        if (sx <= bx || sx >= bx + bw - 1) continue;
-                        // Fade: full bright at centre, normal at edge
-                        int dist = abs(dx2);
-                        lv_color_t sc = (dist <= STRIPE_HW / 3)
-                            ? lv_color_hex(0x90CAF9)  // near-white blue at core
-                            : lv_color_hex(0x42A5F5); // medium-light blue at shoulders
-                        fb[sy * LCD_WIDTH + sx] = sc;
-                    }
+                    int sx = stripe_cx + dx2;
+                    if (sx <= bx || sx >= bx + bw - 1) continue;
+                    // Fade: full bright at centre, normal at edge
+                    int dist = abs(dx2);
+                    lv_color_t sc = (dist <= STRIPE_HW / 3)
+                        ? lv_color_hex(0x90CAF9)  // near-white blue at core
+                        : lv_color_hex(0x42A5F5); // medium-light blue at shoulders
+                    fb[sy * MAP_SIZE + sx] = sc;
                 }
             }
-
-            // 1-px white rim
-            lv_color_t rim = lv_color_hex(0xffffff);
-            fbFillRect(fb, bx,        by,        bw, 1,  rim);
-            fbFillRect(fb, bx,        by+bh-1,   bw, 1,  rim);
-            fbFillRect(fb, bx,        by,        1,  bh, rim);
-            fbFillRect(fb, bx+bw-1,   by,        1,  bh, rim);
-            // Text: 5px left padding, top of text area = by + 4
-            fbDrawText(fb, bx + 6, by + 4, statusText, lv_color_hex(0xffffff));
         }
 
-    } // end fb_idx loop
+        // 1-px white rim
+        lv_color_t rim = lv_color_hex(0xffffff);
+        fbFillRect(fb, bx,        by,        bw, 1,  rim);
+        fbFillRect(fb, bx,        by+bh-1,   bw, 1,  rim);
+        fbFillRect(fb, bx,        by,        1,  bh, rim);
+        fbFillRect(fb, bx+bw-1,   by,        1,  bh, rim);
+        // Text: 5px left padding, top of text area = by + 4
+        fbDrawText(fb, bx + 6, by + 4, statusText, lv_color_hex(0xffffff));
+    }
+
+    // map_buf is updated; tell LVGL to redraw canvas_map through the normal
+    // render pipeline (partial-buffer flush via lvgl_flush_cb -> draw_bitmap).
+    lv_obj_invalidate(canvas_map);
 }
 
 // ============================================================
@@ -6472,21 +6435,16 @@ static void update_ui()
         if (lbl)
             lbl_set(lbl, rotatorEnabled ? LV_SYMBOL_POWER " Disable" : LV_SYMBOL_POWER " Enable");
     }
-    // Only update map/bearing when the Rotator tab (index 3) is visible.
-    // Direct framebuffer writes must never run while another tab is on screen —
-    // they would overwrite that tab's content at the coordinates where the map sits.
+    // Only update map/bearing when the Rotator tab (index 3) is visible — no point
+    // recomputing it while the user can't see it.
     bool rotatorTabActive = (tabview && lv_tabview_get_tab_act(tabview) == 3);
     {
         static bool wasRotatorTabActive = false;
         if (rotatorTabActive && !wasRotatorTabActive)
         {
             // Just switched to rotator tab — force full map + bearing redraw.
-            // Reset fb coords: canvas_map was off-screen while another tab was
-            // active so any previously cached coords are wrong.
             mapBaseDirty = true;
             mapDirty     = true;
-            map_fb_x     = 0;
-            map_fb_y     = 0;
         }
         wasRotatorTabActive = rotatorTabActive;
     }
@@ -6519,9 +6477,8 @@ static void update_ui()
                                   (rotatorMoving != lastMapMoving) ||
                                   (rotatorOnline != lastMapOnline) ||
                                   mapDirty;
-            // Skip direct FB writes while the map-confirm dialog is open —
-            // the overlay lives on lv_layer_top() but direct writes bypass LVGL
-            // and would overwrite the semi-transparent dialog pixels.
+            // Skip while the map-confirm dialog is open — no need to churn the
+            // map underneath it.
             if (bearingChanged && !pendingMapDialog)
             {
                 updateBearingLinesDirect();
@@ -6932,20 +6889,22 @@ void setup()
     // Initialize LVGL
     lv_init();
 
-    // Single PSRAM frame buffer: DMA always reads buf1 via the bounce buffer pipeline.
-    // No double-buffer swap means no vsync pointer-flip race that caused the
-    // "content shift / top wraps to bottom" display artifact.
-    ESP_ERROR_CHECK(esp_lcd_rgb_panel_get_frame_buffer(s_panel_handle, 1, (void **)&buf1));
-    lv_disp_draw_buf_init(&draw_buf, buf1, NULL, LCD_WIDTH * LCD_HEIGHT);
+    size_t buf_size = LCD_WIDTH * LVGL_BUF_LINES * sizeof(lv_color_t);
+    buf1 = (lv_color_t *)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM);
+    buf2 = (lv_color_t *)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM);
+    if (!buf1 || !buf2)
+    {
+        debugLog("[LVGL] PSRAM alloc failed, falling back to internal RAM");
+        buf1 = (lv_color_t *)malloc(buf_size);
+        buf2 = nullptr;
+    }
+    lv_disp_draw_buf_init(&draw_buf, buf1, buf2, LCD_WIDTH * LVGL_BUF_LINES);
 
     lv_disp_drv_init(&disp_drv);
     disp_drv.hor_res = LCD_WIDTH;
     disp_drv.ver_res = LCD_HEIGHT;
     disp_drv.flush_cb = lvgl_flush_cb;
     disp_drv.draw_buf = &draw_buf;
-    disp_drv.direct_mode = 1; // LVGL renders directly into the PSRAM frame buffer
-    // full_refresh intentionally NOT set: causes continuous full-screen redraws that
-    // produce artifacts on the overview page and contend with the bounce-buffer ISR.
     lv_disp_drv_register(&disp_drv);
 
     lv_indev_drv_init(&indev_drv);
@@ -6974,9 +6933,6 @@ void setup()
     // Build UI
     create_ui();
     debugLog("[UI] Tab view created");
-    // canvas_map coords are NOT captured here: the rotator tab (index 3) is
-    // inactive at startup so its objects are scrolled off-screen. Coords are
-    // resolved lazily in updateBearingLinesDirect() once the tab is first shown.
 
     // Start WiFi
     // ESP32-S3 with RGB panel + OPI PSRAM: the bounce-buffer ISR runs at interrupt

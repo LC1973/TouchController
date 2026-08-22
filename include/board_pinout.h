@@ -86,17 +86,27 @@
 #define LCD_HEIGHT 600
 
 // RGB timing (common 1024x600 timing values for EK79007/compatible panels)
-// Reduced to 14MHz and expanded the blanking porches. This gives the PSRAM DMA controller
-// massive rests between horizontal lines to serve Wi-Fi routing without starving the screen.
-#define LCD_FREQ_WRITE 14000000
+// Restored 2026-08-23 ("Attempt E") to the values from this project's very first
+// commit (477709e, "WIP: Replace LovyanGFX with esp_lcd_new_rgb_panel"), after user
+// recalled the display used to work and everything tried this session (Attempts
+// A-D: various num_fbs/bounce_buffer/pclk combinations, all built on the "zero-copy
+// direct_mode" driver architecture) failed to reproduce that. Tracing git history
+// found the zero-copy direct_mode architecture — and this reduced 14MHz timing —
+// was introduced together in one commit (b492e07, "Restore full-featured main.cpp")
+// that also re-pasted in a large amount of application code; the display driver
+// changes look like incidental fallout of that restore, not a deliberate, tested
+// fix. See RGB_PANEL_NOTES.md, "Attempt E: revert to the original architecture".
+// 30MHz here gives ~32.75Hz refresh (916146 total pclks/frame) — much closer to a
+// normal refresh rate than anything tried this session (12.9-16.4Hz).
+#define LCD_FREQ_WRITE 30000000
 #define LCD_HSYNC_POLARITY 0
-#define LCD_HSYNC_FRONT_PORCH 160
-#define LCD_HSYNC_PULSE_WIDTH 20
-#define LCD_HSYNC_BACK_PORCH 140
+#define LCD_HSYNC_FRONT_PORCH 48
+#define LCD_HSYNC_PULSE_WIDTH 162
+#define LCD_HSYNC_BACK_PORCH 152
 #define LCD_VSYNC_POLARITY 0
-#define LCD_VSYNC_FRONT_PORCH 12
-#define LCD_VSYNC_PULSE_WIDTH 3
-#define LCD_VSYNC_BACK_PORCH 20
+#define LCD_VSYNC_FRONT_PORCH 3
+#define LCD_VSYNC_PULSE_WIDTH 45
+#define LCD_VSYNC_BACK_PORCH 13
 #define LCD_PCLK_ACTIVE_NEG 1
 #define LCD_DE_IDLE_HIGH 0
 #define LCD_PCLK_IDLE_HIGH 0
