@@ -16,7 +16,7 @@
             "projectEnvName": "touchpanel-ota",
             "toolchainBinDir": "C:/BuildCache/platformio/packages/toolchain-xtensa-esp-elf/bin",
             "internalConsoleOptions": "openOnSessionStart",
-            "svdPath": "C:/BuildCache/platformio/platforms/espressif32@src-596c9938872833461cb0fe93e12b1b9f/misc/svd/esp32s3.svd",
+            "svdPath": "C:/BuildCache/platformio/platforms/espressif32/misc/svd/esp32s3.svd",
             "preLaunchTask": {
                 "type": "PlatformIO",
                 "task": "Pre-Debug (touchpanel-ota)"
@@ -30,7 +30,7 @@
             "projectEnvName": "touchpanel-ota",
             "toolchainBinDir": "C:/BuildCache/platformio/packages/toolchain-xtensa-esp-elf/bin",
             "internalConsoleOptions": "openOnSessionStart",
-            "svdPath": "C:/BuildCache/platformio/platforms/espressif32@src-596c9938872833461cb0fe93e12b1b9f/misc/svd/esp32s3.svd"
+            "svdPath": "C:/BuildCache/platformio/platforms/espressif32/misc/svd/esp32s3.svd"
         },
         {
             "type": "platformio-debug",
@@ -40,7 +40,7 @@
             "projectEnvName": "touchpanel-ota",
             "toolchainBinDir": "C:/BuildCache/platformio/packages/toolchain-xtensa-esp-elf/bin",
             "internalConsoleOptions": "openOnSessionStart",
-            "svdPath": "C:/BuildCache/platformio/platforms/espressif32@src-596c9938872833461cb0fe93e12b1b9f/misc/svd/esp32s3.svd",
+            "svdPath": "C:/BuildCache/platformio/platforms/espressif32/misc/svd/esp32s3.svd",
             "loadMode": "manual"
         }
     ]

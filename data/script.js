@@ -140,6 +140,32 @@ function clearLog() {
   }
 }
 
+function toggleDebugLog(enable) {
+  fetch('/toggledebuglog?enabled=' + enable).then(function (r) {
+    if (r.ok) location.reload();
+    else alert('Failed to toggle debug logging.');
+  });
+}
+
+// Panel-check prompt: asks whether the touch panel display looks correct right
+// now, roughly every 5 minutes, regardless of which page of the site is open.
+// Deliberately does NOT touch the touch panel itself (no button on its UI) —
+// switching tabs on the device can itself clear a corruption episode, which
+// would destroy the evidence before it could be reported. The "due" time is
+// kept in localStorage (not a JS variable) so the 5-minute cadence survives
+// page navigation and the /log page's own 15s auto-reload.
+var PANEL_CHECK_INTERVAL_MS = 300000; // 5 minutes
+
+function checkPanelPrompt() {
+  var due = parseInt(localStorage.getItem('panelCheckDue') || '0', 10);
+  if (Date.now() < due) return;
+  // Set the next due time BEFORE showing the (blocking) confirm dialog, so a
+  // slow response doesn't compress the next interval.
+  localStorage.setItem('panelCheckDue', String(Date.now() + PANEL_CHECK_INTERVAL_MS));
+  var ok = confirm('Touch panel check: is the display showing correctly right now?\n\nOK = looks fine\nCancel = display is corrupted/glitched');
+  fetch('/api/panelcheck?status=' + (ok ? 'good' : 'bad')).catch(function () { });
+}
+
 document.addEventListener('DOMContentLoaded', function () {
   updateStatus();
   if (window.location.pathname === '/' || window.location.pathname === '') {
@@ -150,4 +176,11 @@ document.addEventListener('DOMContentLoaded', function () {
     var logBox = document.querySelector('.log-box');
     if (logBox) logBox.scrollTop = logBox.scrollHeight;
   }
+
+  if (!localStorage.getItem('panelCheckDue')) {
+    // First-ever load: don't nag immediately, start the countdown fresh.
+    localStorage.setItem('panelCheckDue', String(Date.now() + PANEL_CHECK_INTERVAL_MS));
+  }
+  checkPanelPrompt();
+  setInterval(checkPanelPrompt, 10000);
 });

@@ -22,6 +22,7 @@
 
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_rgb.h"
+#include "esp_cache.h"
 #include "freertos/semphr.h"
 
 #include <ArduinoJson.h>
@@ -338,6 +339,17 @@ static void blinkBacklightProbe(uint8_t cycles = 6, uint16_t intervalMs = 250)
 
 static esp_lcd_panel_handle_t s_panel_handle = NULL;
 
+// Base address of the panel driver's own internal PSRAM frame buffer. NOT used
+// for rendering (LVGL renders into its own separate buf1/buf2 strip buffers, per
+// the "Attempt E" architecture below) — used only so lvgl_flush_cb() can compute
+// the address range to explicitly cache-writeback after each strip copy. See the
+// esp_cache_msync() call in lvgl_flush_cb() and RGB_PANEL_NOTES.md, "Ongoing
+// investigation: long-duration corruption episodes" for why this was added
+// (2026-08-26: garbled/scrambled corruption, not fixed by periodic restart+repaint,
+// pointing at stale/torn CPU cache writes to the PSRAM frame buffer rather than a
+// GDMA timing desync).
+static lv_color_t *s_hw_fb = nullptr;
+
 // Height, in rows, of each LVGL partial-render strip buffer (see buf1/buf2 below).
 #define LVGL_BUF_LINES 48
 
@@ -569,6 +581,23 @@ String deviceName = "touch-controller";
 String tciHost = "";
 uint16_t tciPort = 40001;
 bool tciEnabled = false;
+// SPIFFS/flash debug logging. Default on (matches prior behaviour). Toggleable at
+// runtime (Settings page checkbox, or the quick toggle on the Log page) because
+// DebugLogger's periodic flush is a flash write on the same task as LVGL rendering
+// and a suspected contributor to intermittent RGB panel corruption — see
+// RGB_PANEL_NOTES.md. Disabling it only stops the SPIFFS file write; Serial and the
+// in-memory log buffer (visible on the Log page) keep working either way.
+bool debugLoggingEnabled = true;
+// WiFi auto-reconnect (WiFiManager's periodic STA reconnect / AP-mode scan-back).
+// Default on (matches prior behaviour). Both of those paths block whichever task
+// calls WiFiManager::loop() — this project's main loop(), the same task that
+// drives lv_timer_handler() — for up to 15s per attempt, repeated with exponential
+// backoff across several minutes during a real WiFi outage. Suspected contributor
+// to intermittent RGB panel corruption that persists for extended periods rather
+// than a brief blip — see RGB_PANEL_NOTES.md. Disabling it leaves WiFi disconnected
+// if it drops (no auto-recovery) until manually re-enabled or the device reboots;
+// intended for isolating this as a cause, not for normal operation.
+bool wifiAutoReconnectEnabled = true;
 
 // mDNS peer discovery
 PeerDiscovery peerDiscovery;
@@ -779,6 +808,18 @@ static unsigned long lastUiUpdate = 0;
 #define UI_UPDATE_INTERVAL 300
 static volatile bool otaInProgress = false;
 
+// Periodic display self-heal: a cheap, DMA-only RGB panel restart (fixes
+// GDMA/scan-out timing desync). Added 2026-08-26 after research confirmed
+// PSRAM-framebuffer RGB LCD corruption on ESP32-S3 is a known, still-unresolved
+// architectural limitation (CPU and GDMA share PSRAM bandwidth 50/50 with no
+// priority scheme) rather than an application bug to hunt further — see
+// RGB_PANEL_NOTES.md, "Ongoing investigation: long-duration corruption episodes".
+// A full-screen LVGL repaint used to run alongside this too, but was REMOVED
+// after it measurably made things worse (corruption recurred faster with it than
+// without) — see the comment at the call site in loop() before re-adding one.
+static unsigned long lastPanelHealthCheck = 0;
+#define PANEL_HEALTH_INTERVAL_MS 30000
+
 // ============================================================
 // IP-based peer polling (discovered via mDNS)
 // ============================================================
@@ -881,7 +922,14 @@ static unsigned long antennaLastUpdate = 0;
 
 static unsigned long lastPropProxyPoll = 0;
 static unsigned long lastLinkPoll = 0;
-#define PROP_PROXY_POLL_INTERVAL 30000
+// Prop tab poll/redraw are configurable (Settings page) — the user's working
+// hypothesis (2026-09-02) is that the Prop tab's periodic update (up to 24
+// lv_bar_set_value() calls plus several labels/meters, all in one burst every
+// poll) is a contributor to the ongoing intermittent RGB panel corruption (see
+// RGB_PANEL_NOTES.md). Disabling it entirely, or slowing it down, isolates that
+// as a variable without needing a firmware rebuild to test.
+bool propUpdatesEnabled = true;
+unsigned long propPollIntervalMs = 30000;
 #define LINK_POLL_INTERVAL       30000
 
 // Rotator memory bank: fetched from rotator /api/memory on startup and periodically
@@ -1610,7 +1658,9 @@ static void pollVfoFast()
 
 static void pollPropagationProxy()
 {
-    if (millis() - lastPropProxyPoll < PROP_PROXY_POLL_INTERVAL)
+    if (!propUpdatesEnabled)
+        return;
+    if (millis() - lastPropProxyPoll < propPollIntervalMs)
         return;
     lastPropProxyPoll = millis();
 
@@ -1767,6 +1817,24 @@ static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t 
                               area->x1, area->y1,
                               area->x2 + 1, area->y2 + 1,
                               color_p);
+
+    // Explicit cache writeback for the rows just written, so the bounce-buffer
+    // ISR (reads PSRAM directly, on its own schedule, independent of this code)
+    // can never see stale/torn CPU-cached data for this region. Added 2026-08-26
+    // after garbled/scrambled corruption (not fixed by periodic restart+repaint)
+    // pointed at stale cache writes rather than a GDMA timing desync — see
+    // RGB_PANEL_NOTES.md, "Ongoing investigation: long-duration corruption
+    // episodes". Flushes full rows (not just the changed columns) to keep the
+    // addressing simple and guaranteed cache-line-aligned (LCD_WIDTH * 2 bytes
+    // is always a multiple of the 64-byte cache line).
+    if (s_hw_fb)
+    {
+        size_t rowBytes = (size_t)LCD_WIDTH * sizeof(lv_color_t);
+        void *flushAddr = (uint8_t *)s_hw_fb + (size_t)area->y1 * rowBytes;
+        size_t flushSize = (size_t)(area->y2 - area->y1 + 1) * rowBytes;
+        esp_cache_msync(flushAddr, flushSize, ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+    }
+
     lv_disp_flush_ready(drv);
 }
 
@@ -1889,9 +1957,42 @@ void loadConfig()
         debugLog("[CONFIG] TCI Host: " + tciHost + ":" + String(tciPort) + (tciEnabled ? " (enabled)" : " (disabled)"));
     }
 
+    propUpdatesEnabled = doc["propUpdatesEnabled"] | true;
+    propPollIntervalMs = (doc["propPollIntervalSec"] | 30UL) * 1000UL;
+    debugLogf("[CONFIG] Prop panel updates: %s, interval %lus",
+              propUpdatesEnabled ? "enabled" : "disabled", propPollIntervalMs / 1000UL);
+
+    debugLoggingEnabled = doc["debugLoggingEnabled"] | true;
+    if (debugLoggingEnabled)
+        DebugLogger::enableSpiffs();
+    else
+        DebugLogger::disableSpiffs();
+    debugLog(debugLoggingEnabled ? "[CONFIG] Flash debug logging enabled" : "[CONFIG] Flash debug logging disabled");
+
+    wifiAutoReconnectEnabled = doc["wifiAutoReconnectEnabled"] | true;
+    WiFiManager::setAutoReconnect(wifiAutoReconnectEnabled);
+    debugLog(wifiAutoReconnectEnabled ? "[CONFIG] WiFi auto-reconnect enabled" : "[CONFIG] WiFi auto-reconnect DISABLED");
+
     debugLogf("[CONFIG] WiFi SSID: %s, device: %s",
               wifiSSID.c_str(), deviceName.c_str());
 }
+
+// Deferred SPIFFS config mirror write (see saveConfig() below): confirmed
+// 2026-09-02 that a settings save which actually changes a value blocks loop()
+// for up to ~260ms (NVS write + this SPIFFS mirror write combined), and that
+// stall has a real, roughly-random chance of corrupting the RGB panel — same
+// architecture-level PSRAM-contention mechanism as the rest of this
+// investigation, just via a much longer single stall than routine 300ms UI
+// ticks. The SPIFFS write (24-180ms, the larger and more variable of the two)
+// is the one piece of this that's safe to move off the blocking path: it's
+// only a fallback/backup mirror of the NVS copy (loadConfig()'s SPIFFS
+// fallback, handleDownloadConfig()), not the authoritative store, so a few
+// hundred ms of delay before it lands doesn't matter. Picked up by
+// pollTaskFn() (core 0) — the same background task this codebase already uses
+// for "don't stall loop() with I/O" (see its own header comment). See
+// RGB_PANEL_NOTES.md.
+static volatile bool s_spiffsConfigDirty = false;
+static String s_pendingSpiffsJson;
 
 void saveConfig()
 {
@@ -1925,21 +2026,47 @@ void saveConfig()
     tciObj["port"] = tciPort;
     tciObj["enabled"] = tciEnabled;
 
+    doc["propUpdatesEnabled"] = propUpdatesEnabled;
+    doc["propPollIntervalSec"] = propPollIntervalMs / 1000UL;
+
+    doc["debugLoggingEnabled"] = debugLoggingEnabled;
+    doc["wifiAutoReconnectEnabled"] = wifiAutoReconnectEnabled;
+
     // Save to NVS
     String json;
     serializeJson(doc, json);
+    debugLogf("[SAVE] NVS write starting, %u bytes", json.length());
     Preferences prefs;
     prefs.begin("tcfg", false);
     prefs.putString("json", json);
     prefs.end();
+    debugLog("[SAVE] NVS write done");
 
-    // Also save to SPIFFS
-    File f = SPIFFS.open("/config.json", "w");
-    if (f)
-    {
-        f.print(json);
-        f.close();
-    }
+    // Also save to SPIFFS — deferred to pollTaskFn() (core 0), see
+    // s_spiffsConfigDirty above. Guarded by g_dataMutex since s_pendingSpiffsJson
+    // is written here (core 1) and read on core 0.
+    xSemaphoreTake(g_dataMutex, portMAX_DELAY);
+    s_pendingSpiffsJson = json;
+    s_spiffsConfigDirty = true;
+    xSemaphoreGive(g_dataMutex);
+    debugLog("[SAVE] SPIFFS write deferred to background task");
+
+    // Reactive display self-heal: confirmed 2026-09-02 that saving settings which
+    // actually change a value (NVS then genuinely erases/programs flash, unlike a
+    // no-op resave, which the NVS driver silently skips) reliably corrupts the RGB
+    // panel — the first fully reproducible trigger found in this investigation, on
+    // top of the SPIFFS mirror write just above (which always writes, changed or
+    // not, but is small/brief — matches the milder "flicker" seen on a no-op
+    // resave). See RGB_PANEL_NOTES.md. Rather than trying to avoid the flash write
+    // (not possible when a value genuinely changes), proactively resync + repaint
+    // immediately afterward instead of waiting for the passive 30s self-heal timer.
+    // Unlike the periodic full-repaint that was tried and reverted for making
+    // things worse (a recurring PSRAM-heavy burst every 30s regardless of need),
+    // this fires once, reactively, only right after a disruption is now known to
+    // have just happened — a materially different risk profile.
+    esp_lcd_rgb_panel_restart(s_panel_handle);
+    lv_obj_invalidate(lv_scr_act());
+    debugLog("[SAVE] Self-heal (restart+invalidate) called");
 
     debugLog("[CONFIG] Saved");
 }
@@ -1950,6 +2077,7 @@ void saveConfig()
 
 void handleRoot()
 {
+    debugLog("[SAVE] handleRoot() entered (post-redirect page load)");
     String html = loadHTMLPart("/header.html");
     html += R"rawliteral(
 <section class="dashboard">
@@ -2273,6 +2401,9 @@ void handleSettings()
           <tr><td>Password</td><td><input type='password' name='password' value=')rawliteral";
     html += ESP32Utils::htmlEscape(wifiPassword);
     html += R"rawliteral(' maxlength='63'></td></tr>
+          <tr><td>Auto-Reconnect</td><td><label><input type='checkbox' name='wifiAutoReconnectEnabled')rawliteral";
+    html += wifiAutoReconnectEnabled ? " checked" : "";
+    html += R"rawliteral(> Automatically reconnect WiFi if lost (disable only for diagnostics — if WiFi drops while this is off, it stays off until re-enabled or the device reboots)</label></td></tr>
         </tbody>
       </table>
       <br>
@@ -2285,6 +2416,9 @@ void handleSettings()
           <tr><td>Syslog Server IP</td><td><input type='text' name='syslog' value=')rawliteral";
     html += ESP32Utils::htmlEscape(syslogServerIP);
     html += R"rawliteral(' maxlength='15' placeholder='192.168.2.11'></td></tr>
+          <tr><td>Flash Debug Logging</td><td><label><input type='checkbox' name='debugLoggingEnabled')rawliteral";
+    html += debugLoggingEnabled ? " checked" : "";
+    html += R"rawliteral(> Write debug log to flash (disable if display corruption is suspected to be flash-write related; log still visible on the Log page either way)</label></td></tr>
         </tbody>
       </table>
       <br>
@@ -2300,6 +2434,18 @@ void handleSettings()
           <tr><td>Enable TCI</td><td><label><input type='checkbox' name='tciEnabled')rawliteral";
     html += tciEnabled ? " checked" : "";
     html += R"rawliteral(> Enable direct TCI connection</label></td></tr>
+        </tbody>
+      </table>
+      <br>
+      <table class='settings-table'>
+        <thead><tr><th colspan='2'>Propagation Panel</th></tr></thead>
+        <tbody>
+          <tr><td>Enable Prop Panel Updates</td><td><label><input type='checkbox' name='propUpdatesEnabled')rawliteral";
+    html += propUpdatesEnabled ? " checked" : "";
+    html += R"rawliteral(> Poll and redraw the Prop tab (disable for diagnostics if display corruption is suspected to be related to Prop panel updates — the tab freezes at its last values while off)</label></td></tr>
+          <tr><td>Update Interval (seconds)</td><td><input type='number' name='propPollIntervalSec' value=')rawliteral";
+    html += String(propPollIntervalMs / 1000UL);
+    html += R"rawliteral(' min='5' max='600'></td></tr>
         </tbody>
       </table>
       <br>
@@ -2344,12 +2490,16 @@ void handleSettings()
 
 void handleSave()
 {
+    debugLog("[SAVE] handleSave() entered");
     if (server.hasArg("ssid"))
         wifiSSID = server.arg("ssid");
     if (server.hasArg("password"))
         wifiPassword = server.arg("password");
     if (server.hasArg("deviceName"))
         deviceName = server.arg("deviceName");
+
+    wifiAutoReconnectEnabled = server.hasArg("wifiAutoReconnectEnabled");
+    WiFiManager::setAutoReconnect(wifiAutoReconnectEnabled);
 
     if (server.hasArg("syslog"))
     {
@@ -2370,6 +2520,16 @@ void handleSave()
     if (server.hasArg("tciPort"))
         tciPort = (uint16_t)constrain(server.arg("tciPort").toInt(), 1, 65535);
     tciEnabled = server.hasArg("tciEnabled");
+
+    propUpdatesEnabled = server.hasArg("propUpdatesEnabled");
+    if (server.hasArg("propPollIntervalSec"))
+        propPollIntervalMs = (unsigned long)constrain(server.arg("propPollIntervalSec").toInt(), 5, 600) * 1000UL;
+
+    debugLoggingEnabled = server.hasArg("debugLoggingEnabled");
+    if (debugLoggingEnabled)
+        DebugLogger::enableSpiffs();
+    else
+        DebugLogger::disableSpiffs();
 
     for (int i = 0; i < 6; i++)
     {
@@ -2404,12 +2564,20 @@ void handleSave()
 
     server.sendHeader("Location", "/");
     server.send(303);
+    debugLog("[SAVE] 303 redirect response sent");
 }
 
 void handleLogPage()
 {
     String html = loadHTMLPart("/header.html");
-    html += R"rawliteral(<div class="log-box">)rawliteral";
+    html += R"rawliteral(<p>Flash logging: )rawliteral";
+    html += debugLoggingEnabled ? "<b>ON</b>" : "<b>OFF</b>";
+    html += R"rawliteral( <button class="settings-button" onclick="toggleDebugLog()rawliteral";
+    html += debugLoggingEnabled ? "false" : "true";
+    html += R"rawliteral()">)rawliteral";
+    html += debugLoggingEnabled ? "Turn Off" : "Turn On";
+    html += R"rawliteral(</button></p>
+<div class="log-box">)rawliteral";
 
     String logText = DebugLogger::getLogText();
     if (logText.length() > 0)
@@ -2435,6 +2603,58 @@ void handleClearLog()
     DebugLogger::clearLog();
     debugLog("Log cleared");
     server.send(200, "text/plain", "Log cleared");
+}
+
+void handleToggleDebugLog()
+{
+    debugLoggingEnabled = server.hasArg("enabled") && server.arg("enabled") == "true";
+    if (debugLoggingEnabled)
+        DebugLogger::enableSpiffs();
+    else
+        DebugLogger::disableSpiffs();
+    saveConfig();
+    debugLog(debugLoggingEnabled ? "[LOG] Flash debug logging enabled" : "[LOG] Flash debug logging disabled");
+    server.send(200, "text/plain", "OK");
+}
+
+// Records a user-reported "does the touch panel display look correct right now"
+// check, prompted by script.js every ~5 minutes from any page on the site.
+// Deliberately does not touch the touch panel's own UI (see script.js comment) —
+// this is reported purely from the browser so investigating a corruption episode
+// can never itself clear it. Logs a single self-contained snapshot line (rather
+// than just a timestamp) so each report can be read on its own without needing to
+// correlate against a separate log stream — see RGB_PANEL_NOTES.md, "Ongoing
+// investigation: long-duration corruption episodes".
+void handlePanelCheck()
+{
+    String status = server.hasArg("status") ? server.arg("status") : "unknown";
+
+    unsigned long secs = millis() / 1000;
+    unsigned long h = secs / 3600;
+    unsigned long m = (secs % 3600) / 60;
+
+    static const char *tabNames[] = {"Overview", "Power", "Antennas", "Rotator", "Prop"};
+    int tabIdx = tabview ? lv_tabview_get_tab_act(tabview) : -1;
+    const char *tabName = (tabIdx >= 0 && tabIdx < 5) ? tabNames[tabIdx] : "?";
+
+    int peerCount = peerDiscovery.peerCount();
+    const DiscoveredPeer *peers = peerDiscovery.peers();
+    int reachableCount = 0;
+    for (int i = 0; i < peerCount; i++)
+    {
+        if (peers[i].reachable && (millis() - peers[i].lastSeen) < 30000)
+            reachableCount++;
+    }
+
+    int rssi = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
+
+    debugLogf("[PANELCHECK] status=%s uptime=%luh%lum heap=%luKB psram=%luKB wifi=%s(%ddBm) tab=%s peersReachable=%d/%d",
+              status.c_str(), h, m,
+              (unsigned long)(ESP.getFreeHeap() / 1024), (unsigned long)(ESP.getFreePsram() / 1024),
+              WiFi.status() == WL_CONNECTED ? "up" : "DOWN", rssi,
+              tabName, reachableCount, peerCount);
+
+    server.send(200, "text/plain", "OK");
 }
 
 void handleReboot()
@@ -2500,6 +2720,8 @@ void setupWebServer()
     server.on("/save", handleSave);
     server.on("/log", handleLogPage);
     server.on("/clearlog", HTTP_GET, handleClearLog);
+    server.on("/toggledebuglog", HTTP_GET, handleToggleDebugLog);
+    server.on("/api/panelcheck", HTTP_GET, handlePanelCheck);
     server.on("/api/status", handleStatusApi);
     // Receive push notification from antenna-controller on antenna change.
     // Resets the VFO poll timer so the next loop() iteration fetches immediately.
@@ -3988,6 +4210,7 @@ static void create_overview_tab(lv_obj_t *parent)
     lv_label_set_text(lbl_wifi, "WiFi: not connected");
     lv_obj_set_style_text_font(lbl_wifi, &lv_font_montserrat_14, 0);
     lv_label_set_long_mode(lbl_wifi, LV_LABEL_LONG_CLIP);
+    lv_label_set_recolor(lbl_wifi, true); // RSSI value coloured green/amber/red in update_ui()
     lv_obj_set_flex_grow(lbl_wifi, 1);
     lv_obj_set_height(lbl_wifi, 20);
 
@@ -4021,6 +4244,7 @@ static void create_overview_tab(lv_obj_t *parent)
     lv_obj_set_style_text_font(lbl_overview_hw, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(lbl_overview_hw, lv_color_hex(0x8fa0ae), 0);
     lv_label_set_long_mode(lbl_overview_hw, LV_LABEL_LONG_CLIP);
+    lv_label_set_recolor(lbl_overview_hw, true); // Heap/PSRAM values coloured green/amber/red in update_ui()
     lv_obj_set_size(lbl_overview_hw, 350, 16);
 
     // Peer count label
@@ -5884,6 +6108,15 @@ static void relay_pulse_timer_cb(lv_timer_t *t)
 
 static void update_propagation_tab()
 {
+    // Diagnostic bail-out (Settings page "Enable Prop Panel Updates" checkbox):
+    // when disabled, skip every widget touch on this tab, not just the network
+    // poll that feeds it — isolates whether the Prop tab's redraw burst itself
+    // (up to 24 lv_bar_set_value() calls plus labels/meters, all in one 300ms
+    // tick) is contributing to the RGB panel corruption under investigation.
+    // See RGB_PANEL_NOTES.md.
+    if (!propUpdatesEnabled)
+        return;
+
     char buf[64];
 
     // Cache solar indicator values — meters and text-colour only update when values change.
@@ -6142,10 +6375,16 @@ static void update_propagation_tab()
     {
         if (solarData.valid)
         {
+            // Seconds shown only for the first minute, then dropped — matches the
+            // uptime/peer-uptime throttling. This label was missed when that fix
+            // was applied (found at the time to be Overview-only); ticking every
+            // second forever, unconditionally, on a second confirmed-affected tab.
+            // See RGB_PANEL_NOTES.md, "Ongoing investigation: long-duration
+            // corruption episodes".
             auto fmtAge = [](int s, char *out, int sz) {
                 if (s < 0)       snprintf(out, sz, "--");
                 else if (s < 60) snprintf(out, sz, "%ds", s);
-                else             snprintf(out, sz, "%dm%02ds", s / 60, s % 60);
+                else             snprintf(out, sz, "%dm", s / 60);
             };
             char sa[12], pa[12];
             fmtAge(solarData.ageSeconds,    sa, sizeof(sa));
@@ -6163,17 +6402,24 @@ static void update_ui()
     unsigned long secs = millis() / 1000;
     char buf[512];
 
-    // Uptime - show only relevant units
+    // Uptime - seconds shown only for the first minute, then dropped. This used to
+    // tick every second forever, making it the only unconditionally-redrawing
+    // widget in the whole app and the one thing unique to the Overview tab where
+    // intermittent display corruption has been isolated to (see RGB_PANEL_NOTES.md,
+    // "Ongoing investigation: long-duration corruption episodes"). Matches the
+    // pattern already used for peer uptimes just below and the WiFi RSSI label
+    // further down, both of which were already throttled for the same reason
+    // ("3Hz dirty marks").
     {
         unsigned long h = secs / 3600;
         unsigned long m = (secs % 3600) / 60;
         unsigned long s = secs % 60;
-        if (h > 0)
-            snprintf(buf, sizeof(buf), "Uptime: %luh %lum %lus", h, m, s);
-        else if (m > 0)
-            snprintf(buf, sizeof(buf), "Uptime: %lum %lus", m, s);
-        else
+        if (secs < 60)
             snprintf(buf, sizeof(buf), "Uptime: %lus", s);
+        else if (h > 0)
+            snprintf(buf, sizeof(buf), "Uptime: %luh %lum", h, m);
+        else
+            snprintf(buf, sizeof(buf), "Uptime: %lum", m);
     }
     if (lbl_uptime)
         lbl_set(lbl_uptime, buf);
@@ -6186,8 +6432,24 @@ static void update_ui()
 
     if (lbl_overview_hw)
     {
-        snprintf(buf, sizeof(buf), "Heap: %lu KB   PSRAM: %lu KB",
-                 ESP.getFreeHeap() / 1024, ESP.getFreePsram() / 1024);
+        // Round to nearest 10 KB to suppress noise-driven redraws — free heap/PSRAM
+        // shifts by a few KB on nearly every 300ms sample (LVGL routes all its own
+        // allocations through PSRAM, and several pollers allocate JSON buffers every
+        // 300ms-5s), so raw KB values changed almost every update_ui() cycle. Same
+        // pattern as the WiFi RSSI rounding and the uptime throttling above — see
+        // RGB_PANEL_NOTES.md, "Ongoing investigation: long-duration corruption episodes".
+        unsigned long heapKB = ((ESP.getFreeHeap() + 5120) / 10240) * 10;
+        unsigned long psramKB = ((ESP.getFreePsram() + 5120) / 10240) * 10;
+        // Colour-code so a glance shows whether either is getting tight. Thresholds
+        // are estimates (internal DRAM is ~320KB total with ~100KB reserved for WiFi;
+        // PSRAM is ~8MB total, mostly LVGL/JSON-buffer-backed) — adjust once real
+        // steady-state figures are known.
+        const char *heapColor = (heapKB >= 50) ? "4caf50" : (heapKB >= 20) ? "ff9800"
+                                                                            : "f44336";
+        const char *psramColor = (psramKB >= 1024) ? "4caf50" : (psramKB >= 256) ? "ff9800"
+                                                                                  : "f44336";
+        snprintf(buf, sizeof(buf), "Heap: #%s %lu KB#   PSRAM: #%s %lu KB#",
+                 heapColor, heapKB, psramColor, psramKB);
         lbl_set(lbl_overview_hw, buf);
     }
 
@@ -6196,10 +6458,20 @@ static void update_ui()
     {
         if (WiFi.status() == WL_CONNECTED)
         {
-            // Round RSSI to nearest 5 dBm to suppress noise-driven redraws
-            int rssi5 = (WiFi.RSSI() / 5) * 5;
-            snprintf(buf, sizeof(buf), "WiFi: %s  IP: %s  RSSI: %d dBm",
-                     WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(), rssi5);
+            // Round RSSI to nearest 5 dBm to suppress noise-driven redraws.
+            // NOTE: plain (WiFi.RSSI()/5)*5 truncates toward zero for negative
+            // numbers, which gives inconsistent bucket edges (e.g. -58 and -59 land
+            // in the -55 bucket while -60/-61/-62 land in -60) — a reading that
+            // hovers near a boundary can flip buckets on ordinary ±1 dBm measurement
+            // noise, defeating the point of rounding. This is proper round-to-
+            // nearest-5 for both signs.
+            int rssi = WiFi.RSSI();
+            int rssi5 = ((rssi + (rssi >= 0 ? 2 : -2)) / 5) * 5;
+            // Colour-code signal quality at a glance.
+            const char *rssiColor = (rssi5 >= -60) ? "4caf50" : (rssi5 >= -70) ? "ff9800"
+                                                                                : "f44336";
+            snprintf(buf, sizeof(buf), "WiFi: %s  IP: %s  RSSI: #%s %d dBm#",
+                     WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(), rssiColor, rssi5);
         }
         else
         {
@@ -6261,7 +6533,7 @@ static void update_ui()
                     else if (u >= 3600)
                         snprintf(buf, sizeof(buf), "%uh %um", u / 3600, (u % 3600) / 60);
                     else if (u >= 60)
-                        snprintf(buf, sizeof(buf), "%um %us", u / 60, u % 60);
+                        snprintf(buf, sizeof(buf), "%um", u / 60);
                     else
                         snprintf(buf, sizeof(buf), "%us", u);
                     lbl_set(peer_uptime_labels[row], buf);
@@ -6794,6 +7066,21 @@ static void pollTaskFn(void *pv)
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
+        if (s_spiffsConfigDirty)
+        {
+            String toWrite;
+            xSemaphoreTake(g_dataMutex, portMAX_DELAY);
+            toWrite = s_pendingSpiffsJson;
+            s_spiffsConfigDirty = false;
+            xSemaphoreGive(g_dataMutex);
+            File f = SPIFFS.open("/config.json", "w");
+            if (f)
+            {
+                f.print(toWrite);
+                f.close();
+            }
+            debugLog("[SAVE] Deferred SPIFFS write completed (background task)");
+        }
         processHttpCommandQueue();
         pollAllPeers();
         pollRotatorFast();
@@ -6855,6 +7142,10 @@ void setup()
     // OPI PSRAM (no bounce buffer → cache-incoherent DMA on chip rev v0.2).
     initRgbPanel();
     Serial.printf("[LCD] RGB panel init OK (%dx%d)\n", LCD_WIDTH, LCD_HEIGHT);
+
+    // Fetch the panel driver's internal frame buffer address for cache-writeback
+    // purposes only (see s_hw_fb declaration above) — not used for rendering.
+    ESP_ERROR_CHECK(esp_lcd_rgb_panel_get_frame_buffer(s_panel_handle, 1, (void **)&s_hw_fb));
 
     // gCh422Wire is already up from blinkBacklightProbe(). Since we no longer
     // call lcd.init(), the LGFX GT911 ESP-IDF driver never ran and CH422 state
@@ -7043,8 +7334,9 @@ void setup()
 
 void loop()
 {
-    // LVGL task handler.  flush_cb blocks internally until the vsync DMA swap
-    // completes, so lv_timer_handler() returns only after the frame is on screen.
+    // LVGL task handler. flush_cb (Attempt E architecture) does not block — it
+    // hands each rendered strip to esp_lcd_panel_draw_bitmap() and returns
+    // immediately; there is no vsync wait here. See RGB_PANEL_NOTES.md.
     lv_timer_handler();
 
     // Web server
@@ -7070,6 +7362,24 @@ void loop()
 
     // Logger maintenance
     DebugLogger::periodicFlush();
+
+    // Periodic display self-heal (see comment at PANEL_HEALTH_INTERVAL_MS above).
+    // esp_lcd_rgb_panel_restart() only takes effect at the next vsync — it does
+    // not stall loop(). The lv_obj_invalidate(lv_scr_act()) full-screen repaint
+    // that used to run alongside this was REMOVED 2026-08-26: corruption recurred
+    // faster (within ~5 min) with it in place than without any mitigation at all,
+    // consistent with the repaint itself being a large, guaranteed, recurring
+    // burst of exactly the CPU-touching-PSRAM activity the whole investigation
+    // says competes with GDMA for bandwidth — i.e. it was plausibly a new source
+    // of triggers, not a cure. restart() alone is a cheap, DMA-only operation
+    // with no PSRAM burst, so it stays. See RGB_PANEL_NOTES.md, "Ongoing
+    // investigation: long-duration corruption episodes" before re-adding a
+    // periodic repaint here.
+    if (millis() - lastPanelHealthCheck > PANEL_HEALTH_INTERVAL_MS)
+    {
+        lastPanelHealthCheck = millis();
+        esp_lcd_rgb_panel_restart(s_panel_handle);
+    }
 
     // Periodic UI update — reads shared state; protect with mutex
     if (millis() - lastUiUpdate > UI_UPDATE_INTERVAL)
