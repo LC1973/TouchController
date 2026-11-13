@@ -1597,6 +1597,37 @@ that rules out flash writes as the ambient cause entirely and points back to the
 broader PSRAM/GDMA bandwidth-contention research from 2026-08-26 (WiFi traffic
 itself, LVGL rendering, etc. — non-write-related contention).
 
+## Platform switch (2026-11-13): official espressif32 brings the roll/flicker back — reverted
+
+Switched `platformio.ini` from the pioarduino platform (55.03.38, Arduino-ESP32 libs
+`5.5.4+sha.735507283d`) to the official `platformio/espressif32@8.0.0` (Arduino-ESP32
+3.3.12, ESP-IDF 5.5.5) to drop the pioarduino dependency. It compiled cleanly with **no
+application code changes**, but on hardware gave **severe flicker plus a vertical
+scroll a couple of times a second**, much worse than anything seen on the Attempt E
+baseline.
+
+**Cause:** the two platforms ship differently configured precompiled libraries. When
+the `qio_opi` `sdkconfig.h` files are diffed, every LCD/PSRAM setting matches (`CONFIG_LCD_RGB_RESTART_IN_VSYNC`,
+`CONFIG_SPIRAM_SPEED_80M`, octal PSRAM, 240 MHz, `FREERTOS_HZ=1000`), but the CPU
+caches are halved on the official build:
+
+| Setting | pioarduino 55.03.38 | official 8.0.0 |
+|---|---|---|
+| Data cache | 64 KB, 64 B lines | 32 KB, 32 B lines |
+| Instruction cache | 32 KB | 16 KB |
+
+A smaller cache means far more CPU cache misses going out to PSRAM, which is the same
+CPU/GDMA PSRAM-bandwidth contention described in "Hardware/driver background". That
+starves the bounce-buffer refill ISR and makes the image roll. Cache sizes are
+fixed when the Arduino core is compiled, so they can't be changed from a plain
+`framework = arduino` project.
+
+**Resolution:** reverted to the pioarduino platform. If dropping pioarduino comes up
+again, the only real route is `framework = arduino, espidf` with a project
+`sdkconfig` setting `CONFIG_ESP32S3_DATA_CACHE_64KB`, `CONFIG_ESP32S3_DATA_CACHE_LINE_64B`
+and `CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB`. That is a much bigger change (all of
+ESP-IDF builds from source) and needs a full hardware soak test.
+
 ## References
 
 - [ESP-IDF RGB LCD docs — Avoiding Tearing Effects / known issues](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/api-reference/peripherals/lcd/rgb_lcd.html)
